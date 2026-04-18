@@ -1,0 +1,118 @@
+"""CAN データベース読込・シグナルデコード
+
+cantools ライブラリを使用して DBC / ARXML ファイルからフレーム/シグナル定義を取得し、
+CAN フレームデータをデコードする。
+"""
+
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import cantools
+
+from models.can_frame import CanFrame
+from models.signal_value import SignalValue
+
+# 対応するデータベースファイル拡張子
+SUPPORTED_EXTENSIONS = {".dbc", ".arxml"}
+
+
+class DbcLoader:
+    """CAN データベースの読込・管理・デコード（DBC / ARXML 対応）"""
+
+    def __init__(self):
+        self._db = cantools.database.Database()
+        self._loaded_files: List[str] = []
+
+    @property
+    def loaded_files(self) -> List[str]:
+        return list(self._loaded_files)
+
+    @property
+    def messages(self) -> list:
+        return self._db.messages
+
+    def load_file(self, file_path: str) -> None:
+        """データベースファイルを追加読込する（DBC / ARXML 自動判別、複数ファイル対応）"""
+        ext = Path(file_path).suffix.lower()
+        if ext == ".dbc":
+            self._db.add_dbc_file(file_path)
+        elif ext == ".arxml":
+            self._db.add_arxml_file(file_path)
+        else:
+            raise ValueError(
+                f"未対応のファイル形式: {ext} "
+                f"(対応形式: {', '.join(sorted(SUPPORTED_EXTENSIONS))})"
+            )
+        self._loaded_files.append(file_path)
+
+    def clear(self) -> None:
+        """読込済み DBC をクリアする"""
+        self._db = cantools.database.Database()
+        self._loaded_files.clear()
+
+    def get_frame_name(self, arbitration_id: int) -> Optional[str]:
+        """フレーム ID からフレーム名を取得"""
+        try:
+            msg = self._db.get_message_by_frame_id(arbitration_id)
+            return msg.name
+        except KeyError:
+            return None
+
+    def resolve_frame_names(self, frames: List[CanFrame]) -> None:
+        """フレームリストの frame_name を DBC で一括解決する"""
+        for frame in frames:
+            if frame.frame_name is None:
+                frame.frame_name = self.get_frame_name(frame.arbitration_id)
+
+    def decode_frame(self, frame: CanFrame) -> List[SignalValue]:
+        """フレームのデータを DBC でデコードし、シグナル値のリストを返す"""
+        try:
+            msg = self._db.get_message_by_frame_id(frame.arbitration_id)
+        except KeyError:
+            return []
+
+        try:
+            decoded = msg.decode(frame.data, decode_choices=False)
+        except Exception:
+            return []
+
+        result = []
+        for signal in msg.signals:
+            if signal.name in decoded:
+                phys_val = decoded[signal.name]
+                # raw 値の逆算
+                if signal.scale and signal.scale != 0:
+                    raw = int((phys_val - signal.offset) / signal.scale)
+                else:
+                    raw = int(phys_val)
+                result.append(SignalValue(
+                    signal_name=signal.name,
+                    raw_value=raw,
+                    physical_value=float(phys_val),
+                    unit=signal.unit or "",
+                    timestamp=frame.timestamp,
+                    frame_id=frame.arbitration_id,
+                ))
+        return result
+
+    def get_signal_info(self, arbitration_id: int) -> List[dict]:
+        """指定フレームのシグナル情報を辞書リストで返す"""
+        try:
+            msg = self._db.get_message_by_frame_id(arbitration_id)
+        except KeyError:
+            return []
+
+        return [
+            {
+                "name": s.name,
+                "start_bit": s.start,
+                "length": s.length,
+                "byte_order": s.byte_order,
+                "scale": s.scale,
+                "offset": s.offset,
+                "unit": s.unit or "",
+                "minimum": s.minimum,
+                "maximum": s.maximum,
+            }
+            for s in msg.signals
+        ]
