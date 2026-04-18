@@ -58,6 +58,17 @@ class DbcLoader:
         except KeyError:
             return None
 
+    def get_cycle_time_ms(self, arbitration_id: int) -> Optional[float]:
+        """フレーム ID から送信周期 (ms) を取得する。DBC/ARXML で未定義の場合は None"""
+        try:
+            msg = self._db.get_message_by_frame_id(arbitration_id)
+        except KeyError:
+            return None
+        ct = getattr(msg, "cycle_time", None)
+        if ct is None or ct <= 0:
+            return None
+        return float(ct)
+
     def resolve_frame_names(self, frames: List[CanFrame]) -> None:
         """フレームリストの frame_name を DBC で一括解決する"""
         for frame in frames:

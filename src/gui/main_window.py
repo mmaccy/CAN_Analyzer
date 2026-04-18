@@ -10,6 +10,7 @@ import flet as ft
 _FLET_LEGACY = hasattr(ft, "FilePickerResultEvent")
 
 from models.can_frame import AscHeader, CanFrame
+from models.app_config import AppConfig, CONFIG_FILE_EXTENSION, load_config, save_config
 from can_parser.asc_parser import load_all_frames, parse_header
 from can_parser.asc_writer import export_filtered
 from can_parser.dbc_loader import DbcLoader
@@ -52,12 +53,22 @@ class MainWindow:
             self._asc_picker = ft.FilePicker(on_result=self._on_asc_picked)
             self._dbc_picker = ft.FilePicker(on_result=self._on_dbc_picked)
             self._export_picker = ft.FilePicker(on_result=self._on_export_path_picked)
-            page.overlay.extend([self._asc_picker, self._dbc_picker, self._export_picker])
+            self._config_save_picker = ft.FilePicker(on_result=self._on_config_save_picked)
+            self._config_load_picker = ft.FilePicker(on_result=self._on_config_load_picked)
+            page.overlay.extend([
+                self._asc_picker, self._dbc_picker, self._export_picker,
+                self._config_save_picker, self._config_load_picker,
+            ])
         else:
             self._asc_picker = ft.FilePicker()
             self._dbc_picker = ft.FilePicker()
             self._export_picker = ft.FilePicker()
-            page.services.extend([self._asc_picker, self._dbc_picker, self._export_picker])
+            self._config_save_picker = ft.FilePicker()
+            self._config_load_picker = ft.FilePicker()
+            page.services.extend([
+                self._asc_picker, self._dbc_picker, self._export_picker,
+                self._config_save_picker, self._config_load_picker,
+            ])
 
         # ステータスバー
         self._status_file = ft.Text("ファイル未読込", size=11)
@@ -84,6 +95,17 @@ class MainWindow:
                 ft.ElevatedButton(
                     "エクスポート", icon=ft.Icons.SAVE_ALT,
                     on_click=self._on_export,
+                ),
+                ft.VerticalDivider(width=1),
+                ft.ElevatedButton(
+                    "設定保存", icon=ft.Icons.SAVE,
+                    on_click=self._on_save_config,
+                    tooltip="選択シグナル等の設定を .canalzcfg として保存",
+                ),
+                ft.ElevatedButton(
+                    "設定読込", icon=ft.Icons.UPLOAD_FILE,
+                    on_click=self._on_load_config,
+                    tooltip=".canalzcfg を読み込んで選択シグナルを復元",
                 ),
                 ft.Container(expand=True),
                 self._progress_bar,
@@ -401,6 +423,79 @@ class MainWindow:
             self._progress_text.value = ""
             self._show_snackbar(f"エクスポートエラー: {ex}")
             self.page.update()
+
+    # ---------- Config Save / Load ----------
+
+    async def _on_save_config(self, e) -> None:
+        if _FLET_LEGACY:
+            self._config_save_picker.save_file(
+                dialog_title="設定ファイル保存",
+                allowed_extensions=[CONFIG_FILE_EXTENSION],
+                file_type=ft.FilePickerFileType.CUSTOM,
+                file_name=f"settings.{CONFIG_FILE_EXTENSION}",
+            )
+        else:
+            path = await self._config_save_picker.save_file(
+                dialog_title="設定ファイル保存",
+                allowed_extensions=[CONFIG_FILE_EXTENSION],
+                file_type=ft.FilePickerFileType.CUSTOM,
+                file_name=f"settings.{CONFIG_FILE_EXTENSION}",
+            )
+            if path:
+                self._handle_config_save(path)
+
+    async def _on_load_config(self, e) -> None:
+        if _FLET_LEGACY:
+            self._config_load_picker.pick_files(
+                dialog_title="設定ファイル読込",
+                allowed_extensions=[CONFIG_FILE_EXTENSION],
+                file_type=ft.FilePickerFileType.CUSTOM,
+            )
+        else:
+            files = await self._config_load_picker.pick_files(
+                dialog_title="設定ファイル読込",
+                allowed_extensions=[CONFIG_FILE_EXTENSION],
+                file_type=ft.FilePickerFileType.CUSTOM,
+            )
+            if files:
+                self._handle_config_load(files[0].path)
+
+    def _on_config_save_picked(self, e) -> None:
+        """Legacy callback"""
+        if not e.path:
+            return
+        self._handle_config_save(e.path)
+
+    def _on_config_load_picked(self, e) -> None:
+        """Legacy callback"""
+        if not e.files:
+            return
+        self._handle_config_load(e.files[0].path)
+
+    def _handle_config_save(self, output_path: str) -> None:
+        if not output_path.endswith(f".{CONFIG_FILE_EXTENSION}"):
+            output_path += f".{CONFIG_FILE_EXTENSION}"
+        try:
+            cfg = AppConfig(selected_signals=self._signal_tree.get_selected_signals())
+            save_config(cfg, output_path)
+            self._show_snackbar(f"設定を保存しました: {Path(output_path).name}")
+        except Exception as ex:
+            self._show_snackbar(f"設定保存エラー: {ex}")
+
+    def _handle_config_load(self, input_path: str) -> None:
+        try:
+            cfg = load_config(input_path)
+        except Exception as ex:
+            self._show_snackbar(f"設定読込エラー: {ex}")
+            return
+        if not self._dbc_loader.loaded_files:
+            self._show_snackbar("先に DBC/ARXML を読み込んでください（設定のシグナル名は DBC 基準）")
+            return
+        self._signal_tree.set_selected_signals(cfg.selected_signals)
+        self._show_snackbar(
+            f"設定を読み込みました: {len(cfg.selected_signals)} 件のシグナル選択を復元"
+        )
+        self.page.update()
 
     # ---------- Callbacks ----------
 
