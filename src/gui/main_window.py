@@ -13,6 +13,7 @@ from models.can_frame import AscHeader, CanFrame
 from models.app_config import AppConfig, CONFIG_FILE_EXTENSION, load_config, save_config
 from can_parser.asc_parser import load_all_frames, parse_header
 from can_parser.asc_writer import export_filtered
+from can_parser.asc_index import load_index_if_valid, save_index
 from can_parser.dbc_loader import DbcLoader
 from gui.trace_panel import TracePanel
 from gui.signal_tree_panel import SignalTreePanel
@@ -40,9 +41,12 @@ class MainWindow:
 
         # パネル
         self._trace_panel = TracePanel(on_frame_select=self._on_frame_selected)
-        self._graph_panel = GraphPanel()
+        self._graph_panel = GraphPanel(on_request_png_save=self._request_graph_png_save)
         self._signal_tree = SignalTreePanel(on_selection_changed=self._on_signal_selection_changed)
         self._statistics_panel = StatisticsPanel()
+
+        # PNG 保存用: 要求時に figure を一時保持
+        self._pending_png_figure = None
 
         # プログレス
         self._progress_bar = ft.ProgressBar(visible=False, expand=True)
@@ -53,20 +57,26 @@ class MainWindow:
             self._asc_picker = ft.FilePicker(on_result=self._on_asc_picked)
             self._dbc_picker = ft.FilePicker(on_result=self._on_dbc_picked)
             self._export_picker = ft.FilePicker(on_result=self._on_export_path_picked)
+            self._export_db_picker = ft.FilePicker(on_result=self._on_export_db_path_picked)
+            self._png_picker = ft.FilePicker(on_result=self._on_png_path_picked)
             self._config_save_picker = ft.FilePicker(on_result=self._on_config_save_picked)
             self._config_load_picker = ft.FilePicker(on_result=self._on_config_load_picked)
             page.overlay.extend([
-                self._asc_picker, self._dbc_picker, self._export_picker,
+                self._asc_picker, self._dbc_picker, self._export_picker, self._export_db_picker,
+                self._png_picker,
                 self._config_save_picker, self._config_load_picker,
             ])
         else:
             self._asc_picker = ft.FilePicker()
             self._dbc_picker = ft.FilePicker()
             self._export_picker = ft.FilePicker()
+            self._export_db_picker = ft.FilePicker()
+            self._png_picker = ft.FilePicker()
             self._config_save_picker = ft.FilePicker()
             self._config_load_picker = ft.FilePicker()
             page.services.extend([
-                self._asc_picker, self._dbc_picker, self._export_picker,
+                self._asc_picker, self._dbc_picker, self._export_picker, self._export_db_picker,
+                self._png_picker,
                 self._config_save_picker, self._config_load_picker,
             ])
 
@@ -95,6 +105,12 @@ class MainWindow:
                 ft.ElevatedButton(
                     "エクスポート", icon=ft.Icons.SAVE_ALT,
                     on_click=self._on_export,
+                    tooltip="トレースで現在表示中のフレームをエクスポート",
+                ),
+                ft.ElevatedButton(
+                    "DB 抽出", icon=ft.Icons.FILTER_ALT,
+                    on_click=self._on_export_db_only,
+                    tooltip="読込済み DBC/ARXML に定義されているフレームのみを抜粋してエクスポート",
                 ),
                 ft.VerticalDivider(width=1),
                 ft.ElevatedButton(
@@ -253,6 +269,34 @@ class MainWindow:
             if path:
                 self._handle_export_path(path)
 
+    async def _on_export_db_only(self, e) -> None:
+        """DB で定義されているフレームのみを抜粋してエクスポート"""
+        if not self._asc_path:
+            self._show_snackbar("先に ASC ファイルを読み込んでください")
+            return
+        if not self._dbc_loader.loaded_files:
+            self._show_snackbar("先に DBC/ARXML を読み込んでください")
+            return
+        # 出力ファイル名のデフォルトは元 ASC 名 + _db_extract
+        src_stem = Path(self._asc_path).stem
+        default_name = f"{src_stem}_db_extract.asc"
+        if _FLET_LEGACY:
+            self._export_db_picker.save_file(
+                dialog_title="DB 抽出の保存先を指定",
+                allowed_extensions=["asc"],
+                file_type=ft.FilePickerFileType.CUSTOM,
+                file_name=default_name,
+            )
+        else:
+            path = await self._export_db_picker.save_file(
+                dialog_title="DB 抽出の保存先を指定",
+                allowed_extensions=["asc"],
+                file_type=ft.FilePickerFileType.CUSTOM,
+                file_name=default_name,
+            )
+            if path:
+                self._handle_export_db_path(path)
+
     def _on_asc_picked(self, e) -> None:
         """Legacy callback (Flet <=0.28)"""
         if not e.files:
@@ -275,28 +319,54 @@ class MainWindow:
         thread.start()
 
     def _load_asc_worker(self, path: str) -> None:
-        """ワーカースレッド: ASC ファイル読込"""
-        try:
-            self._header = parse_header(path)
+        """ワーカースレッド: ASC ファイル読込 (インデックス優先)"""
+        import time
 
-            import time
-            _last_ui_update = [0.0]
-
-            def progress_cb(read_bytes, total_bytes):
+        def _throttled_progress(phase: str, last_ui_update: list):
+            """0.3 秒ごとに間引いて UI 更新するコールバックを生成"""
+            def _cb(done: int, total: int) -> None:
                 now = time.monotonic()
-                # UI 更新は最大 0.3 秒ごとに抑制
-                if now - _last_ui_update[0] < 0.3:
+                if now - last_ui_update[0] < 0.3 and done < total:
                     return
-                _last_ui_update[0] = now
-                pct = read_bytes / total_bytes if total_bytes > 0 else 0
+                last_ui_update[0] = now
+                pct = (done / total) if total > 0 else 0
                 self._progress_bar.value = pct
-                self._progress_text.value = f"読込中... {pct*100:.0f}%"
+                if done >= total:
+                    self._progress_text.value = f"{phase} 完了"
+                else:
+                    self._progress_text.value = f"{phase} {pct*100:.0f}% ({done:,}/{total:,})"
                 try:
                     self.page.update()
                 except RuntimeError:
-                    pass  # dictionary changed size — 無視して続行
+                    pass
+            return _cb
 
-            self._frames = load_all_frames(path, progress_callback=progress_cb)
+        try:
+            # 1) 既存インデックスの利用を試行（GB 級でも秒で開く）
+            idx_progress = _throttled_progress("インデックス読込中", [0.0])
+            idx = load_index_if_valid(path, progress_callback=idx_progress)
+            if idx is not None and idx.header is not None:
+                self._header = idx.header
+                self._frames = idx.frames
+                if self._dbc_loader.loaded_files:
+                    self._dbc_loader.resolve_frame_names(self._frames)
+                self._on_asc_loaded()
+                return
+
+            # 2) テキストからフルパース
+            self._header = parse_header(path)
+            parse_cb = _throttled_progress("読込中", [0.0])
+
+            def bytes_progress(read_bytes, total_bytes):
+                # load_all_frames は (bytes, total_bytes) を渡してくるので
+                # 件数ベースの throttled_progress と同じ関数で扱う。
+                parse_cb(read_bytes, total_bytes)
+
+            self._frames = load_all_frames(path, progress_callback=bytes_progress)
+
+            # 3) インデックス保存（次回高速化）。失敗しても本処理は継続。
+            save_cb = _throttled_progress("インデックス保存中", [0.0])
+            save_index(path, self._header, self._frames, progress_callback=save_cb)
 
             # DBC でフレーム名解決
             if self._dbc_loader.loaded_files:
@@ -316,6 +386,7 @@ class MainWindow:
         self._progress_text.value = ""
 
         self._trace_panel.set_frames(self._frames)
+        self._trace_panel.set_dbc(self._dbc_loader)
 
         # シグナルツリーに存在フレーム ID を設定
         log_ids = set(f.arbitration_id for f in self._frames)
@@ -359,9 +430,13 @@ class MainWindow:
         if self._frames:
             self._dbc_loader.resolve_frame_names(self._frames)
             self._trace_panel.set_frames(self._frames)
+            self._trace_panel.set_dbc(self._dbc_loader)
             self._graph_panel.set_data(self._frames, self._dbc_loader)
             log_ids = set(f.arbitration_id for f in self._frames)
             self._signal_tree.set_log_frame_ids(log_ids)
+        else:
+            # フレーム未読込でも DB 情報だけは先に反映しておく
+            self._trace_panel.set_dbc(self._dbc_loader)
 
         self.page.update()
 
@@ -371,8 +446,14 @@ class MainWindow:
             return
         self._handle_export_path(e.path)
 
+    def _on_export_db_path_picked(self, e) -> None:
+        """Legacy callback for DB 抽出"""
+        if not e.path:
+            return
+        self._handle_export_db_path(e.path)
+
     def _handle_export_path(self, output_path: str) -> None:
-        """エクスポート先パスの共通処理"""
+        """エクスポート先パスの共通処理（トレースフィルタベース）"""
         if not output_path.endswith(".asc"):
             output_path += ".asc"
 
@@ -386,6 +467,27 @@ class MainWindow:
         thread = threading.Thread(
             target=self._export_worker,
             args=(output_path, filtered_ids),
+            daemon=True,
+        )
+        thread.start()
+
+    def _handle_export_db_path(self, output_path: str) -> None:
+        """DB 定義フレームのみエクスポート"""
+        if not output_path.endswith(".asc"):
+            output_path += ".asc"
+
+        db_ids = self._dbc_loader.get_defined_frame_ids()
+        if not db_ids:
+            self._show_snackbar("DB 定義フレームが 0 件です")
+            return
+
+        self._progress_bar.visible = True
+        self._progress_text.value = f"DB 抽出中... (対象 {len(db_ids):,} フレーム ID)"
+        self.page.update()
+
+        thread = threading.Thread(
+            target=self._export_worker,
+            args=(output_path, db_ids),
             daemon=True,
         )
         thread.start()
@@ -423,6 +525,72 @@ class MainWindow:
             self._progress_text.value = ""
             self._show_snackbar(f"エクスポートエラー: {ex}")
             self.page.update()
+
+    # ---------- Graph PNG Save ----------
+
+    def _request_graph_png_save(self, figure, signal_hint: Optional[str] = None) -> None:
+        """GraphPanel からのコールバック: figure を保持して保存ダイアログを開く
+
+        単一シグナル選択時は `[ASC名]_[シグナル名].png`、
+        それ以外は `[ASC名]_graph.png` を既定ファイル名とする。
+        """
+        self._pending_png_figure = figure
+        default_name = self._build_png_default_name(signal_hint)
+
+        if _FLET_LEGACY:
+            self._png_picker.save_file(
+                dialog_title="PNG 保存先",
+                allowed_extensions=["png"],
+                file_type=ft.FilePickerFileType.CUSTOM,
+                file_name=default_name,
+            )
+        else:
+            # 非 legacy は save_file が coroutine のため page.run_task 経由で実行
+            async def _pick():
+                path = await self._png_picker.save_file(
+                    dialog_title="PNG 保存先",
+                    allowed_extensions=["png"],
+                    file_type=ft.FilePickerFileType.CUSTOM,
+                    file_name=default_name,
+                )
+                if path:
+                    self._handle_png_save_path(path)
+
+            try:
+                self.page.run_task(_pick)
+            except (AttributeError, RuntimeError):
+                pass
+
+    def _build_png_default_name(self, signal_hint: Optional[str]) -> str:
+        """PNG 保存時の既定ファイル名を生成する"""
+        stem = Path(self._asc_path).stem if self._asc_path else "graph"
+        if signal_hint:
+            # ファイル名として安全な文字に限定（空白や記号を削らずそのまま使う）
+            return f"{stem}_{signal_hint}.png"
+        return f"{stem}_graph.png"
+
+    def _on_png_path_picked(self, e) -> None:
+        """Legacy callback"""
+        if not e.path:
+            return
+        self._handle_png_save_path(e.path)
+
+    def _handle_png_save_path(self, output_path: str) -> None:
+        """保存先が確定した時の共通処理"""
+        if not output_path.lower().endswith(".png"):
+            output_path += ".png"
+        fig = self._pending_png_figure
+        self._pending_png_figure = None
+        if fig is None:
+            self._show_snackbar("保存対象のグラフがありません")
+            return
+        try:
+            # kaleido 経由で PNG を書き出す（scale=2 で高解像度）
+            fig.write_image(output_path, format="png", width=1600, height=900, scale=2)
+            self._show_snackbar(f"PNG 保存完了: {Path(output_path).name}")
+        except Exception as ex:
+            self._show_snackbar(f"PNG 保存エラー: {ex}")
+        self.page.update()
 
     # ---------- Config Save / Load ----------
 

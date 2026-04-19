@@ -5,9 +5,109 @@ DBC に基づくフレーム・シグナルのツリー表示。
 """
 
 import flet as ft
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from can_parser.dbc_loader import DbcLoader
+
+
+# ツールチップで 1 シグナルあたり何件までの choice（Value Table）を表示するか。
+# これを超える場合は末尾を省略表記に切り替える。
+_MAX_TOOLTIP_CHOICES = 20
+
+
+def _build_signal_tooltip(signal: Any, frame_name: str, frame_id: int) -> str:
+    """cantools Signal オブジェクトから表示用の詳細ツールチップを組み立てる。
+
+    ARXML / DBC から読み取れる情報を漏れなく拾うが、未設定属性は行ごと省く。
+    """
+    lines: List[str] = []
+
+    # 基本: フレーム情報 + シグナル名
+    lines.append(f"{signal.name}")
+    lines.append(f"Frame: {frame_name} (0x{frame_id:X})")
+
+    # 説明 (Description / Comment)
+    comment = getattr(signal, "comment", None)
+    if isinstance(comment, dict):
+        # 多言語 dict の場合はデフォルト or 最初の値
+        comment = comment.get(None) or next(iter(comment.values()), None)
+    if comment:
+        lines.append("")
+        lines.append(f"説明: {comment}")
+
+    # ビット配置・型
+    bit_start = getattr(signal, "start", None)
+    bit_length = getattr(signal, "length", None)
+    byte_order = getattr(signal, "byte_order", None)
+    is_signed = getattr(signal, "is_signed", None)
+    is_float = getattr(signal, "is_float", None)
+    lines.append("")
+    if bit_start is not None and bit_length is not None:
+        lines.append(f"ビット位置: bit{bit_start}, 長さ: {bit_length}")
+    if byte_order:
+        lines.append(f"バイトオーダー: {byte_order}")
+    type_parts = []
+    if is_float:
+        type_parts.append("float")
+    elif is_signed is not None:
+        type_parts.append("signed" if is_signed else "unsigned")
+    if type_parts:
+        lines.append(f"型: {' / '.join(type_parts)}")
+
+    # 物理値変換 (factor / offset / unit / min / max)
+    scale = getattr(signal, "scale", None)
+    offset = getattr(signal, "offset", None)
+    unit = getattr(signal, "unit", None)
+    minimum = getattr(signal, "minimum", None)
+    maximum = getattr(signal, "maximum", None)
+    initial = getattr(signal, "initial", None)
+    conv_lines = []
+    if scale is not None:
+        conv_lines.append(f"factor: {scale}")
+    if offset is not None:
+        conv_lines.append(f"offset: {offset}")
+    if unit:
+        conv_lines.append(f"unit: {unit}")
+    if conv_lines:
+        lines.append("")
+        lines.append("物理値: " + ", ".join(conv_lines))
+    range_parts = []
+    if minimum is not None:
+        range_parts.append(f"min={minimum}")
+    if maximum is not None:
+        range_parts.append(f"max={maximum}")
+    if initial is not None:
+        range_parts.append(f"initial={initial}")
+    if range_parts:
+        lines.append("範囲: " + ", ".join(range_parts))
+
+    # Value Table (choices)
+    choices = getattr(signal, "choices", None)
+    if choices:
+        lines.append("")
+        lines.append("値定義:")
+        items = list(choices.items())
+        for raw_val, label in items[:_MAX_TOOLTIP_CHOICES]:
+            lines.append(f"  {raw_val} = {label}")
+        if len(items) > _MAX_TOOLTIP_CHOICES:
+            lines.append(f"  ... (他 {len(items) - _MAX_TOOLTIP_CHOICES} 項目)")
+
+    # 送受信ノード（任意情報）
+    receivers = getattr(signal, "receivers", None)
+    if receivers:
+        lines.append("")
+        lines.append("受信ノード: " + ", ".join(str(r) for r in receivers))
+
+    # 多重化情報
+    if getattr(signal, "is_multiplexer", False):
+        lines.append("")
+        lines.append("(マルチプレクサシグナル)")
+    mux_ids = getattr(signal, "multiplexer_ids", None)
+    mux_signal = getattr(signal, "multiplexer_signal", None)
+    if mux_signal:
+        lines.append(f"多重化親: {mux_signal} (id={list(mux_ids) if mux_ids else '?'})")
+
+    return "\n".join(lines)
 
 
 class SignalTreePanel(ft.Column):
@@ -130,6 +230,7 @@ class SignalTreePanel(ft.Column):
                     on_change=self._on_signal_check_changed,
                     label_style=ft.TextStyle(size=11, font_family="Consolas"),
                     height=28,
+                    tooltip=_build_signal_tooltip(sig, frame_name, frame_id),
                 )
                 signal_controls.append(cb)
 

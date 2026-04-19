@@ -8,7 +8,9 @@ try:
     from flet.plotly_chart import PlotlyChart
 except ModuleNotFoundError:
     from flet_charts.plotly_chart import PlotlyChart
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+import plotly.graph_objects as go
 
 from models.can_frame import CanFrame
 from models.signal_value import SignalValue
@@ -26,15 +28,32 @@ _PLOTLY_COLORS = [
 class GraphPanel(ft.Column):
     """時系列グラフパネル"""
 
-    def __init__(self):
+    def __init__(
+        self,
+        on_request_png_save: Optional[Callable[[go.Figure, Optional[str]], None]] = None,
+    ):
+        """
+        Args:
+            on_request_png_save: PNG 保存ボタンが押された時に呼ばれるコールバック。
+                `(figure, signal_name_hint)` の 2 引数で、単一シグナル選択時のみ
+                `signal_name_hint` にそのシグナル名が入る（それ以外は None）。
+                呼び出し側でファイル名生成と保存ダイアログを扱う。
+        """
         super().__init__(expand=True, spacing=0)
         self._frames: List[CanFrame] = []
+        # frame_id → そのID の CanFrame リスト（大容量ログでも対象 frame のみ走査できる）
+        self._frames_by_id: Dict[int, List[CanFrame]] = {}
         self._dbc_loader: Optional[DbcLoader] = None
         self._selected_signals: List[Tuple[int, str]] = []
         self._use_physical = True
         self._use_subplot = False
         # 強調表示中のシグナル名集合。空なら全シグナルを通常描画
         self._highlighted: Set[str] = set()
+        # 現在のグラフ figure（PNG エクスポート用に保持）
+        self._current_figure: Optional[go.Figure] = None
+        self._on_request_png_save = on_request_png_save
+        # ASC 全体の時間範囲 (X 軸既定値用)
+        self._time_range: Optional[Tuple[float, float]] = None
 
         # ツールバー
         self._physical_toggle = ft.Switch(
@@ -106,7 +125,20 @@ class GraphPanel(ft.Column):
     def set_data(self, frames: List[CanFrame], dbc_loader: Optional[DbcLoader]) -> None:
         """フレームデータと DBC を設定する"""
         self._frames = frames
+        # frame_id → frames の転置インデックスを作成。3.4M 行規模でも選択 frame のみ
+        # 走査できるよう事前に arbitration_id でバケット化しておく。
+        self._frames_by_id = {}
+        for f in frames:
+            self._frames_by_id.setdefault(f.arbitration_id, []).append(f)
         self._dbc_loader = dbc_loader
+        # ASC 全体の時間範囲。グラフ X 軸の既定表示範囲として使用する
+        # (ASC は通常時刻順だが、念のため min/max で計算)。
+        if frames:
+            ts_first = frames[0].timestamp
+            ts_last = frames[-1].timestamp
+            self._time_range = (min(ts_first, ts_last), max(ts_first, ts_last))
+        else:
+            self._time_range = None
         if self._selected_signals:
             self._rebuild_chart()
 
@@ -130,49 +162,98 @@ class GraphPanel(ft.Column):
                 return self._dbc_loader.get_cycle_time_ms(fid)
         return None
 
+    def _non_negative_lookup(self, signal_name: str) -> bool:
+        """シグナルが負値を取らないかを DBC/ARXML 定義から判定する"""
+        if self._dbc_loader is None:
+            return False
+        for fid, sname in self._selected_signals:
+            if sname == signal_name:
+                return self._dbc_loader.is_signal_non_negative(fid, sname)
+        return False
+
     def _rebuild_chart(self) -> None:
         """グラフを再構築する"""
         if not self._selected_signals or not self._dbc_loader or not self._frames:
             self._chart = None
+            self._current_figure = None
             self._chart_container.content = self._placeholder.content
             self._legend_container.visible = False
             self._reset_highlight_btn.visible = False
             return
 
-        # シグナルデータを収集
-        signal_data = self._collect_signal_data()
-        if not signal_data:
+        try:
+            # シグナルデータを収集
+            signal_data = self._collect_signal_data()
+            if not signal_data:
+                self._chart = None
+                self._current_figure = None
+                self._chart_container.content = ft.Container(
+                    content=ft.Text(
+                        "選択シグナルに該当するデータがログ中に見つかりませんでした",
+                        size=13, italic=True, text_align=ft.TextAlign.CENTER,
+                    ),
+                    alignment=ft.Alignment(0, 0),
+                    expand=True,
+                )
+                self._legend_container.visible = False
+                self._reset_highlight_btn.visible = False
+                return
+
+            # グラフ生成
+            if self._use_subplot:
+                fig = build_subplot_graph(
+                    signal_data,
+                    use_physical=self._use_physical,
+                    cycle_time_lookup=self._cycle_time_lookup,
+                    highlighted=self._highlighted or None,
+                    x_range=self._time_range,
+                    non_negative_lookup=self._non_negative_lookup,
+                )
+            else:
+                fig = build_overlay_graph(
+                    signal_data,
+                    use_physical=self._use_physical,
+                    cycle_time_lookup=self._cycle_time_lookup,
+                    highlighted=self._highlighted or None,
+                    x_range=self._time_range,
+                    non_negative_lookup=self._non_negative_lookup,
+                )
+
+            # 毎回 PlotlyChart を新規生成して Container.content を差し替える。
+            # flet 0.84 の object_patch による差分更新では、Column.controls のスロット入替
+            # が PlotlyChart の SVG 再生成を正しくトリガしないケースがあるため、
+            # Container の content 経由で確実に再レンダリングさせる。
+            self._chart = PlotlyChart(figure=fig, expand=True)
+            self._current_figure = fig  # PNG 保存用に保持
+            self._chart_container.content = self._chart
+
+            # 凡例 UI を更新
+            self._rebuild_legend(list(signal_data.keys()))
+        except Exception as ex:
+            # 失敗を握り潰さずに UI 上に出し、原因特定を容易にする
+            import traceback
+            tb = traceback.format_exc()
             self._chart = None
-            self._chart_container.content = self._placeholder.content
+            self._current_figure = None
+            self._chart_container.content = ft.Container(
+                content=ft.Column(
+                    controls=[
+                        ft.Text("グラフ生成エラー", size=14, weight=ft.FontWeight.BOLD, color=ft.Colors.ERROR),
+                        ft.Text(f"{type(ex).__name__}: {ex}", size=12, color=ft.Colors.ERROR),
+                        ft.Container(
+                            content=ft.Text(tb, size=10, font_family="Consolas"),
+                            padding=8,
+                            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
+                        ),
+                    ],
+                    scroll=ft.ScrollMode.AUTO,
+                    spacing=6,
+                ),
+                padding=12,
+                expand=True,
+            )
             self._legend_container.visible = False
             self._reset_highlight_btn.visible = False
-            return
-
-        # グラフ生成
-        if self._use_subplot:
-            fig = build_subplot_graph(
-                signal_data,
-                use_physical=self._use_physical,
-                cycle_time_lookup=self._cycle_time_lookup,
-                highlighted=self._highlighted or None,
-            )
-        else:
-            fig = build_overlay_graph(
-                signal_data,
-                use_physical=self._use_physical,
-                cycle_time_lookup=self._cycle_time_lookup,
-                highlighted=self._highlighted or None,
-            )
-
-        # 毎回 PlotlyChart を新規生成して Container.content を差し替える。
-        # flet 0.84 の object_patch による差分更新では、Column.controls のスロット入替
-        # が PlotlyChart の SVG 再生成を正しくトリガしないケースがあるため、
-        # Container の content 経由で確実に再レンダリングさせる。
-        self._chart = PlotlyChart(figure=fig, expand=True)
-        self._chart_container.content = self._chart
-
-        # 凡例 UI を更新
-        self._rebuild_legend(list(signal_data.keys()))
 
     def _rebuild_legend(self, signal_names: List[str]) -> None:
         """凡例チップ列を再構築する"""
@@ -232,7 +313,12 @@ class GraphPanel(ft.Column):
         self.update()
 
     def _collect_signal_data(self) -> Dict[str, List[SignalValue]]:
-        """選択シグナルに対応するデータを収集"""
+        """選択シグナルに対応するデータを収集
+
+        対象 frame_id に属するフレームのみを走査することで、大容量ログ
+        (数百万行) でも選択シグナル数 × そのフレームの出現回数に比例する
+        計算量に抑える。
+        """
         if not self._dbc_loader:
             return {}
 
@@ -245,14 +331,14 @@ class GraphPanel(ft.Column):
             sname: [] for _, sname in self._selected_signals
         }
 
-        for frame in self._frames:
-            if frame.arbitration_id not in target_map:
-                continue
-            target_signals = target_map[frame.arbitration_id]
-            decoded = self._dbc_loader.decode_frame(frame)
-            for sv in decoded:
-                if sv.signal_name in target_signals:
-                    result[sv.signal_name].append(sv)
+        decode = self._dbc_loader.decode_frame
+        for fid, target_signals in target_map.items():
+            target_set = set(target_signals)
+            frames = self._frames_by_id.get(fid, ())
+            for frame in frames:
+                for sv in decode(frame):
+                    if sv.signal_name in target_set:
+                        result[sv.signal_name].append(sv)
 
         return {k: v for k, v in result.items() if v}
 
@@ -267,6 +353,30 @@ class GraphPanel(ft.Column):
         self.update()
 
     def _on_save_png(self, e) -> None:
-        # Plotly の built-in ダウンロードを使用
-        # (ft.PlotlyChart の config で対応)
-        pass
+        """PNG 保存ボタン: 現在の figure をコールバック経由で保存要求"""
+        if self._current_figure is None:
+            self._show_snackbar("保存するグラフがありません。先にシグナルを選択してください。")
+            return
+        if self._on_request_png_save is None:
+            # MainWindow から未接続（テスト等）
+            return
+        # 単一シグナル選択時のみヒントとしてシグナル名を渡す
+        signal_hint: Optional[str] = None
+        if len(self._selected_signals) == 1:
+            signal_hint = self._selected_signals[0][1]
+        self._on_request_png_save(self._current_figure, signal_hint)
+
+    def _show_snackbar(self, message: str) -> None:
+        page = getattr(self, "page", None)
+        if page is None:
+            return
+        try:
+            sb = ft.SnackBar(ft.Text(message), duration=3000)
+            if hasattr(page, "snack_bar"):
+                page.snack_bar = sb
+                page.snack_bar.open = True
+            else:
+                page.show_dialog(sb)
+            page.update()
+        except Exception:
+            pass

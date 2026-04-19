@@ -65,6 +65,8 @@ def build_overlay_graph(
     use_physical: bool = True,
     cycle_time_lookup: Optional[Callable[[str], Optional[float]]] = None,
     highlighted: Optional[Set[str]] = None,
+    x_range: Optional[Tuple[float, float]] = None,
+    non_negative_lookup: Optional[Callable[[str], bool]] = None,
 ) -> go.Figure:
     """複数シグナルを同一グラフ上にオーバーレイ表示する
 
@@ -75,6 +77,10 @@ def build_overlay_graph(
         cycle_time_lookup: signal_name から送信周期(ms)を返す関数。
             None または 0 以下を返した場合はギャップ検出を行わない。
         highlighted: 強調表示するシグナル名の集合。None/空の場合は全シグナルを通常描画。
+        x_range: 時間軸 (X) の既定表示範囲 (start_sec, end_sec)。
+            ASC ファイル全体の範囲をデフォルトにすることで複数シグナル間の比較を容易にする。
+        non_negative_lookup: signal_name が負値を取らないかを判定する関数。
+            すべてのトレースが非負なら Y 軸の最小値を 0 に固定する。
     """
     fig = go.Figure()
 
@@ -105,9 +111,24 @@ def build_overlay_graph(
         xaxis_title="Time (s)",
         yaxis_title="Value",
         hovermode="x unified",
+        # Plotly はトレースが 1 本のとき凡例を自動で隠す仕様のため、
+        # 単一シグナルでもシグナル名が確認できるよう明示的に表示する。
+        showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         dragmode="zoom",
     )
+
+    # X 軸: ASC 全体の時間範囲を既定値にしてグラフ同士の比較を容易化
+    if x_range is not None and x_range[0] < x_range[1]:
+        fig.update_xaxes(range=list(x_range))
+
+    # Y 軸: 全シグナルが非負と判定できる場合のみ min=0 に固定
+    if non_negative_lookup is not None and signal_data:
+        all_non_neg = all(
+            non_negative_lookup(name) for name in signal_data.keys()
+        )
+        if all_non_neg:
+            fig.update_yaxes(rangemode="tozero")
 
     return fig
 
@@ -118,6 +139,8 @@ def build_subplot_graph(
     use_physical: bool = True,
     cycle_time_lookup: Optional[Callable[[str], Optional[float]]] = None,
     highlighted: Optional[Set[str]] = None,
+    x_range: Optional[Tuple[float, float]] = None,
+    non_negative_lookup: Optional[Callable[[str], bool]] = None,
 ) -> go.Figure:
     """シグナルごとにサブプロット（縦並び）で表示する"""
     names = list(signal_data.keys())
@@ -155,7 +178,11 @@ def build_subplot_graph(
             row=i,
             col=1,
         )
-        fig.update_yaxes(title_text=unit if unit else "Value", row=i, col=1)
+        y_kwargs = {"title_text": unit if unit else "Value"}
+        # サブプロット単位で非負判定。該当シグナルだけ min=0 に固定する。
+        if non_negative_lookup is not None and non_negative_lookup(name):
+            y_kwargs["rangemode"] = "tozero"
+        fig.update_yaxes(row=i, col=1, **y_kwargs)
 
     fig.update_layout(
         title=title,
@@ -165,6 +192,10 @@ def build_subplot_graph(
         showlegend=True,
     )
     fig.update_xaxes(title_text="Time (s)", row=len(names), col=1)
+
+    # X 軸: ASC 全体の時間範囲を全サブプロット共通で既定値にする
+    if x_range is not None and x_range[0] < x_range[1]:
+        fig.update_xaxes(range=list(x_range))
 
     return fig
 

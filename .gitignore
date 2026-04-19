@@ -165,6 +165,9 @@ storage/
 # user data
 data/
 
+# ASC インデックスキャッシュ (自動生成、再生成可能)
+*.asc.idx
+
 # Windows thumbnail cache files
 desktop.ini
 thumbs.db

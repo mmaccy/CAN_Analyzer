@@ -21,9 +21,15 @@ class AscHeader:
     raw_header_lines: list = field(default_factory=list)
 
 
-@dataclass
+@dataclass(slots=True)
 class CanFrame:
-    """パース済み CAN/CAN FD フレーム"""
+    """パース済み CAN/CAN FD フレーム
+
+    slots により属性ディクショナリを廃し、1M 行規模での常駐メモリを削減している。
+    raw_line は iter_frames ストリームで元 ASC 行を返すため保持するが、
+    load_all_frames でキャッシュする際には破棄される（エクスポートは元ファイルを
+    再ストリームするため raw_line は常駐不要）。
+    """
     timestamp: float
     channel: int
     arbitration_id: int

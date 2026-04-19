@@ -41,6 +41,18 @@ Long-running I/O (ASC parse, export) runs in `threading.Thread` workers that cal
 
 `can_parser.asc_parser` streams line-by-line (never loads the whole file). Two regexes handle Classic CAN and CAN FD; field widths vary in Vector's CANoe 17.x output so patterns use `\s*` aggressively. Extended IDs are marked with a trailing `x` on the hex ID. CAN FD DLC codes 9–15 map to 12/16/20/24/32/48/64 bytes (see `DLC_TO_LENGTH` in `models/can_frame.py`). Format reference is in `docs/SPEC_CAN_Tool.md` §6.2.
 
+### Large-file handling
+
+Three layers work together for GB-class ASC files:
+
+1. **`CanFrame` uses `@dataclass(slots=True)`** — no per-instance dict, ~50% smaller than a plain dataclass at 1M+ frames.
+2. **`load_all_frames` drops `raw_line` and interns `frame_name`** — `raw_line` is only needed by `asc_writer`, which re-streams the source via `iter_frames` (the writer never sees cached frames). `sys.intern` deduplicates repeated frame names.
+3. **`.asc.idx` cache** — `can_parser.asc_index` serializes `(schema_version, source_file_size, source_mtime_ns, header, frames)` as gzip+pickle next to the source. `load_index_if_valid` validates against current file metadata; `save_index` runs after a full parse. `MainWindow._load_asc_worker` tries the index first. Bump `INDEX_SCHEMA_VERSION` whenever `CanFrame` or `AscHeader` shape changes — stale pickles load as the wrong dataclass.
+
+### Trace virtualization
+
+`TracePanel` uses **page-windowed rendering**, not a single giant ListView. The Python→Flutter IPC serializes the full `controls` list for every `ListView`, so passing 600k+ row controls chokes the transport even if `item_extent` would virtualize the DOM. Instead, only the current page (`PAGE_SIZE = 2000`) is built as `Container` rows, fed into a `ft.ListView(item_extent=_ROW_HEIGHT)`, and swapped via `_render_current_page`. Within a page the fixed `item_extent` gives smooth scrolling with Flutter-side virtualization; between pages, `先頭/前/次/末尾` buttons or the Jump input switch pages. Header row is a separate `Container` above the ListView (not a `DataTable` because DataTable builds every row). Row click populates the bottom detail pane with decoded signals via `DbcLoader.decode_frame`. Jump input does `bisect_left` on timestamps → computes target page (`idx // PAGE_SIZE`) → switches page → `ListView.scroll_to(offset=offset_in_page * _ROW_HEIGHT)` for O(log n) seek.
+
 ### DBC decoding
 
 `DbcLoader.decode_frame` iterates `msg.signals` and only emits a `SignalValue` if the signal name appears in `msg.decode()` output — this correctly filters out inactive multiplexed signals. Raw value is back-computed from physical via `scale`/`offset`. Both `.dbc` and `.arxml` are supported; extension selects the cantools loader.

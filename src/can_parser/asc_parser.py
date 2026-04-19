@@ -13,21 +13,26 @@ from models.can_frame import AscHeader, CanFrame, DLC_TO_LENGTH
 # ---------- regex patterns ----------
 
 # CAN FD line — 固定幅・可変幅の両方に対応
-# フィールド間のスペースが省略される場合があるため \s* を使用する箇所あり
-#   例: "0.001951CANFD" (タイムスタンプ直結), "2Rx" (ch直結dir), "158TM_158" (ID直結name)
+# フィールド間のスペースは可変のため \s+ / \s* を適宜使用する
+#   例: "0.001951CANFD" (タイムスタンプ直結可), "2Rx" (ch直結dir可)
+#
+# フレーム名はオプション。DBC 未定義フレームでは空白列となるため、
+# 「ID の直後の空白 + 名前」全体を optional group として扱う。
+# 名前は必ず英字/アンダースコア始まりで、brs フラグ(0/1) と区別できる。
 _RE_CANFD = re.compile(
     r"^\s*"
-    r"(?P<ts>\d+\.\d+)\s*"              # timestamp (CANFD と直結の場合あり)
+    r"(?P<ts>\d+\.\d+)\s*"                    # timestamp (CANFD と直結の場合あり)
     r"CANFD\s+"
-    r"(?P<ch>\d+)\s*"                    # channel (dir と直結の場合あり)
+    r"(?P<ch>\d+)\s*"                         # channel (dir と直結の場合あり)
     r"(?P<dir>Rx|Tx)\s+"
-    r"(?P<id>[0-9A-Fa-f]+x?)"           # hex ID + optional extended flag
-    r"(?P<name>[A-Za-z_]\S*)?\s+"        # optional frame name (starts with letter/_)
+    r"(?P<id>[0-9A-Fa-f]+x?)"                 # hex ID + optional extended flag
+    r"(?:\s+(?P<name>[A-Za-z_]\S*))?"         # optional: 空白区切りフレーム名
+    r"\s+"
     r"(?P<brs>[01])\s+"
     r"(?P<esi>[01])\s+"
     r"(?P<dlc>[0-9A-Fa-f]+)\s+"
     r"(?P<dlen>\d+)\s+"
-    r"(?P<data>.+)"                      # data + trailing (parsed by _parse_data_bytes)
+    r"(?P<data>.+)"                            # data + trailing (parsed by _parse_data_bytes)
 )
 
 # Classic CAN line — 同様に可変幅対応
@@ -217,5 +222,21 @@ def load_all_frames(
     file_path: str,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> List[CanFrame]:
-    """ASC ファイルの全フレームをリストで返す（小〜中規模ファイル向け）"""
-    return list(iter_frames(file_path, progress_callback))
+    """ASC ファイルの全フレームをリストで返す。
+
+    常駐メモリ削減のため raw_line は破棄し、frame_name は sys.intern で共有する。
+    エクスポート時は asc_writer が別途 iter_frames から raw_line を取得する。
+    """
+    import sys as _sys
+
+    result: List[CanFrame] = []
+    append = result.append
+    intern = _sys.intern
+    for frame in iter_frames(file_path, progress_callback):
+        # raw_line は不要なので空文字に差し替え（空文字はインターン済みシングルトン）。
+        frame.raw_line = ""
+        if frame.frame_name:
+            # 同一フレーム名の文字列を共有し、重複コピーを削減する。
+            frame.frame_name = intern(frame.frame_name)
+        append(frame)
+    return result

@@ -69,6 +69,34 @@ class DbcLoader:
             return None
         return float(ct)
 
+    def get_defined_frame_ids(self) -> set:
+        """読込済み DBC/ARXML に定義されている全フレームの arbitration_id 集合を返す"""
+        return {msg.frame_id for msg in self._db.messages}
+
+    def is_signal_non_negative(self, arbitration_id: int, signal_name: str) -> bool:
+        """指定シグナルが負値を取り得ないかを DBC/ARXML 定義から判定する。
+
+        判定ルール (いずれかを満たせば True):
+        - DBC 定義の minimum >= 0
+        - unsigned かつ offset >= 0（物理値は必ず offset 以上になる）
+        情報が取れない場合は False（= 安全側として auto scale 任せ）。
+        """
+        try:
+            msg = self._db.get_message_by_frame_id(arbitration_id)
+        except KeyError:
+            return False
+        sig = next((s for s in msg.signals if s.name == signal_name), None)
+        if sig is None:
+            return False
+        minimum = getattr(sig, "minimum", None)
+        if minimum is not None and minimum >= 0:
+            return True
+        is_signed = getattr(sig, "is_signed", True)
+        offset = getattr(sig, "offset", 0) or 0
+        if not is_signed and offset >= 0:
+            return True
+        return False
+
     def resolve_frame_names(self, frames: List[CanFrame]) -> None:
         """フレームリストの frame_name を DBC で一括解決する"""
         for frame in frames:
