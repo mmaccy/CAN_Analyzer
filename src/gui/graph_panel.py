@@ -1,6 +1,15 @@
 """グラフパネル — Plotly ベースの時系列グラフ表示
 
-選択シグナルの値を時系列グラフでインタラクティブに表示する。
+選択シグナルの値を時系列グラフで表示する。
+
+描画方式:
+- アプリ内: `PlotlyChart` (kaleido 経由の静的 SVG)。軽量で常時表示に向く。
+  表示されるだけの ModeBar 残骸は `modebar=dict(remove=['all'])` で抑止。
+- フル機能 (ズーム/パン/リセット/ホバー情報表示等): 「ブラウザで開く」ボタン
+  押下時に Plotly 自己完結 HTML を一時ファイルに書き出し、`webbrowser.open`
+  で既定ブラウザに表示。
+  Windows デスクトップの Flet WebView が未対応 (0.84 時点) のため、この構成を採用。
+- PNG 保存は引き続き `fig.write_image` (kaleido) で高解像度書き出し。
 """
 
 import flet as ft
@@ -23,6 +32,15 @@ _PLOTLY_COLORS = [
     "#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A",
     "#19D3F3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52",
 ]
+
+
+# ブラウザに吐き出すインタラクティブ HTML 用の Plotly 設定
+_BROWSER_PLOTLY_CONFIG = {
+    "displayModeBar": True,
+    "displaylogo": False,
+    "responsive": True,
+    "modeBarButtonsToRemove": ["sendDataToCloud"],
+}
 
 
 class GraphPanel(ft.Column):
@@ -69,6 +87,11 @@ class GraphPanel(ft.Column):
         self._save_png_btn = ft.IconButton(
             ft.Icons.IMAGE, tooltip="PNG 保存", on_click=self._on_save_png
         )
+        self._open_browser_btn = ft.IconButton(
+            ft.Icons.OPEN_IN_NEW,
+            tooltip="ブラウザで開く（インタラクティブ・ホバー情報表示）",
+            on_click=self._on_open_in_browser,
+        )
         self._reset_highlight_btn = ft.TextButton(
             "強調解除",
             icon=ft.Icons.CLEAR,
@@ -81,6 +104,7 @@ class GraphPanel(ft.Column):
                 self._subplot_toggle,
                 ft.VerticalDivider(width=1),
                 self._save_png_btn,
+                self._open_browser_btn,
                 self._reset_highlight_btn,
             ],
             spacing=8,
@@ -99,6 +123,7 @@ class GraphPanel(ft.Column):
             visible=False,
         )
 
+        # 静的 SVG チャート領域 (kaleido 経由)
         self._chart: Optional[PlotlyChart] = None
         self._placeholder = ft.Container(
             content=ft.Text(
@@ -172,7 +197,7 @@ class GraphPanel(ft.Column):
         return False
 
     def _rebuild_chart(self) -> None:
-        """グラフを再構築する"""
+        """グラフを再構築する (アプリ内は静的 SVG)"""
         if not self._selected_signals or not self._dbc_loader or not self._frames:
             self._chart = None
             self._current_figure = None
@@ -182,7 +207,6 @@ class GraphPanel(ft.Column):
             return
 
         try:
-            # シグナルデータを収集
             signal_data = self._collect_signal_data()
             if not signal_data:
                 self._chart = None
@@ -199,7 +223,6 @@ class GraphPanel(ft.Column):
                 self._reset_highlight_btn.visible = False
                 return
 
-            # グラフ生成
             if self._use_subplot:
                 fig = build_subplot_graph(
                     signal_data,
@@ -219,18 +242,16 @@ class GraphPanel(ft.Column):
                     non_negative_lookup=self._non_negative_lookup,
                 )
 
-            # 毎回 PlotlyChart を新規生成して Container.content を差し替える。
-            # flet 0.84 の object_patch による差分更新では、Column.controls のスロット入替
-            # が PlotlyChart の SVG 再生成を正しくトリガしないケースがあるため、
-            # Container の content 経由で確実に再レンダリングさせる。
+            # 静的 SVG では操作不能な ModeBar は非表示にする
+            # （インタラクティブ操作は「ブラウザで開く」ボタンで提供）
+            fig.update_layout(modebar=dict(remove=["all"]))
+
+            self._current_figure = fig  # PNG 保存・ブラウザ表示用に保持
             self._chart = PlotlyChart(figure=fig, expand=True)
-            self._current_figure = fig  # PNG 保存用に保持
             self._chart_container.content = self._chart
 
-            # 凡例 UI を更新
             self._rebuild_legend(list(signal_data.keys()))
         except Exception as ex:
-            # 失敗を握り潰さずに UI 上に出し、原因特定を容易にする
             import traceback
             tb = traceback.format_exc()
             self._chart = None
@@ -365,6 +386,32 @@ class GraphPanel(ft.Column):
         if len(self._selected_signals) == 1:
             signal_hint = self._selected_signals[0][1]
         self._on_request_png_save(self._current_figure, signal_hint)
+
+    def _on_open_in_browser(self, e) -> None:
+        """ブラウザで開くボタン: フル機能版 Plotly を既定ブラウザで表示"""
+        if self._current_figure is None:
+            self._show_snackbar("表示するグラフがありません。先にシグナルを選択してください。")
+            return
+        try:
+            import tempfile
+            import webbrowser
+            from pathlib import Path
+
+            # インタラクティブ HTML を生成 (plotly.js を CDN ではなく inline で同梱)
+            html = self._current_figure.to_html(
+                include_plotlyjs="inline",
+                full_html=True,
+                config=_BROWSER_PLOTLY_CONFIG,
+            )
+            # 一時ファイルに書き出してブラウザで開く
+            tmp = tempfile.NamedTemporaryFile(
+                prefix="can_graph_", suffix=".html", delete=False, mode="w", encoding="utf-8"
+            )
+            tmp.write(html)
+            tmp.close()
+            webbrowser.open(Path(tmp.name).as_uri())
+        except Exception as ex:
+            self._show_snackbar(f"ブラウザ表示エラー: {ex}")
 
     def _show_snackbar(self, message: str) -> None:
         page = getattr(self, "page", None)

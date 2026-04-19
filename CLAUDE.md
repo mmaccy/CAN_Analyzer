@@ -63,6 +63,7 @@ This codebase targets both legacy Flet (≤0.28) and current Flet (0.84+). Key c
 
 - **FilePicker API**: Legacy uses `on_result` callbacks + `page.overlay`; new API returns awaitables and uses `page.services`. Selected via `_FLET_LEGACY = hasattr(ft, "FilePickerResultEvent")` in `main_window.py`.
 - **PlotlyChart location**: `flet.plotly_chart` (legacy) vs `flet_charts.plotly_chart` (0.84+, separate `flet-charts` package). `graph_panel.py` tries both. `flet-charts` renders via `kaleido` SVG export — `kaleido>=1.0.0` is a required transitive dep.
+- **No WebView on Windows desktop**: `flet-webview` does not support Windows desktop as of 0.84 (returns "Webview is not yet supported on this Platform"). The in-app graph is a static SVG (`PlotlyChart`). The "ブラウザで開く" button in `graph_panel.py` writes the Plotly self-contained HTML to a temp file and `webbrowser.open`s it so the user gets full Plotly interactivity (zoom/pan/reset/hover tooltips) in the default browser. The in-app SVG's non-functional modebar artifact is suppressed via `fig.update_layout(modebar=dict(remove=['all']))`.
 - **ExpansionTile kwarg**: `expanded` vs `initially_expanded` — `signal_tree_panel.py` introspects `__init__.__code__.co_varnames` at runtime.
 - **Chart refresh**: When selected signals change, `GraphPanel` creates a *new* `PlotlyChart` and swaps it into a `Container.content` (not `Column.controls` slot replacement). Flet 0.84's `object_patch` diff does not reliably re-trigger SVG regeneration on slot replacement — the container swap does.
 
