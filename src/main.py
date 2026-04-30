@@ -1,7 +1,15 @@
 """CAN FD Log Analyzer — Flet エントリポイント"""
 
+import logging
 import sys
 from pathlib import Path
+
+# コンソールにログ出力（GRP-12 ギャップ検出等の診断用）
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 # src ディレクトリをパスに追加
 src_dir = Path(__file__).resolve().parent

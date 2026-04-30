@@ -61,10 +61,16 @@ class MainWindow:
             self._png_picker = ft.FilePicker(on_result=self._on_png_path_picked)
             self._config_save_picker = ft.FilePicker(on_result=self._on_config_save_picked)
             self._config_load_picker = ft.FilePicker(on_result=self._on_config_load_picked)
+            self._custom_def_picker = ft.FilePicker(on_result=self._on_custom_def_picked)
+            self._export_json_picker = ft.FilePicker(on_result=self._on_export_json_picked)
+            self._export_dbc_picker = ft.FilePicker(on_result=self._on_export_dbc_picked)
+            self._export_arxml_picker = ft.FilePicker(on_result=self._on_export_arxml_picked)
             page.overlay.extend([
                 self._asc_picker, self._dbc_picker, self._export_picker, self._export_db_picker,
                 self._png_picker,
                 self._config_save_picker, self._config_load_picker,
+                self._custom_def_picker,
+                self._export_json_picker, self._export_dbc_picker, self._export_arxml_picker,
             ])
         else:
             self._asc_picker = ft.FilePicker()
@@ -74,10 +80,16 @@ class MainWindow:
             self._png_picker = ft.FilePicker()
             self._config_save_picker = ft.FilePicker()
             self._config_load_picker = ft.FilePicker()
+            self._custom_def_picker = ft.FilePicker()
+            self._export_json_picker = ft.FilePicker()
+            self._export_dbc_picker = ft.FilePicker()
+            self._export_arxml_picker = ft.FilePicker()
             page.services.extend([
                 self._asc_picker, self._dbc_picker, self._export_picker, self._export_db_picker,
                 self._png_picker,
                 self._config_save_picker, self._config_load_picker,
+                self._custom_def_picker,
+                self._export_json_picker, self._export_dbc_picker, self._export_arxml_picker,
             ])
 
         # ステータスバー
@@ -111,6 +123,35 @@ class MainWindow:
                     "DB 抽出", icon=ft.Icons.FILTER_ALT,
                     on_click=self._on_export_db_only,
                     tooltip="読込済み DBC/ARXML に定義されているフレームのみを抜粋してエクスポート",
+                ),
+                ft.ElevatedButton(
+                    "カスタム定義", icon=ft.Icons.EDIT_NOTE,
+                    on_click=self._on_open_custom_def,
+                    tooltip="カスタムシグナル定義 JSON を読込 (ARXML 未定義シグナルの追加・既存定義の上書き)",
+                ),
+                ft.PopupMenuButton(
+                    content=ft.Row(
+                        [ft.Icon(ft.Icons.IOS_SHARE, size=18), ft.Text("定義エクスポート", size=13)],
+                        spacing=4,
+                    ),
+                    tooltip="現在のDB定義をエクスポート (JSON / DBC / ARXML)",
+                    items=[
+                        ft.PopupMenuItem(
+                            content="JSON (カスタム定義形式)",
+                            icon=ft.Icon(ft.Icons.DATA_OBJECT),
+                            on_click=self._on_export_def_json,
+                        ),
+                        ft.PopupMenuItem(
+                            content="DBC (Vector CANdb++形式)",
+                            icon=ft.Icon(ft.Icons.DESCRIPTION),
+                            on_click=self._on_export_def_dbc,
+                        ),
+                        ft.PopupMenuItem(
+                            content="ARXML (AUTOSAR形式)",
+                            icon=ft.Icon(ft.Icons.CODE),
+                            on_click=self._on_export_def_arxml,
+                        ),
+                    ],
                 ),
                 ft.VerticalDivider(width=1),
                 ft.ElevatedButton(
@@ -440,6 +481,184 @@ class MainWindow:
 
         self.page.update()
 
+    # ---------- カスタムシグナル定義 ----------
+
+    async def _on_open_custom_def(self, e) -> None:
+        """カスタムシグナル定義 JSON を開く"""
+        if _FLET_LEGACY:
+            self._custom_def_picker.pick_files(
+                dialog_title="カスタムシグナル定義 JSON を開く",
+                allowed_extensions=["json"],
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allow_multiple=True,
+            )
+        else:
+            files = await self._custom_def_picker.pick_files(
+                dialog_title="カスタムシグナル定義 JSON を開く",
+                allowed_extensions=["json"],
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allow_multiple=True,
+            )
+            if files:
+                self._handle_custom_def_files(files)
+
+    def _on_custom_def_picked(self, e) -> None:
+        """Legacy callback (Flet <=0.28)"""
+        if not e.files:
+            return
+        self._handle_custom_def_files(e.files)
+
+    def _handle_custom_def_files(self, files) -> None:
+        """カスタムシグナル定義ファイルの読込処理"""
+        total_count = 0
+        for f in files:
+            try:
+                count = self._dbc_loader.load_custom_file(f.path)
+                total_count += count
+                self._show_snackbar(
+                    f"カスタム定義読込: {Path(f.path).name} ({count} メッセージ追加/更新)"
+                )
+            except Exception as ex:
+                self._show_snackbar(f"カスタム定義エラー: {Path(f.path).name}: {ex}")
+
+        if total_count > 0:
+            # シグナルツリー・トレース・グラフを更新
+            self._signal_tree.set_dbc(self._dbc_loader)
+            n_db = len(self._dbc_loader.loaded_files)
+            n_custom = len(self._dbc_loader.custom_files)
+            self._status_dbc.value = f"DB: {n_db} files + カスタム: {n_custom}"
+
+            if self._frames:
+                self._dbc_loader.resolve_frame_names(self._frames)
+                self._trace_panel.set_frames(self._frames)
+                self._trace_panel.set_dbc(self._dbc_loader)
+                self._graph_panel.set_data(self._frames, self._dbc_loader)
+                log_ids = set(f.arbitration_id for f in self._frames)
+                self._signal_tree.set_log_frame_ids(log_ids)
+            else:
+                self._trace_panel.set_dbc(self._dbc_loader)
+
+        self.page.update()
+
+    # ── 定義エクスポート (JSON / DBC / ARXML) ──────────────
+
+    async def _on_export_def_json(self, e) -> None:
+        """定義エクスポート → JSON"""
+        if not self._dbc_loader.loaded_files and not self._dbc_loader.custom_files:
+            self._show_snackbar("DB が読み込まれていません")
+            return
+        if _FLET_LEGACY:
+            self._export_json_picker.save_file(
+                dialog_title="定義を JSON でエクスポート",
+                allowed_extensions=["json"],
+                file_type=ft.FilePickerFileType.CUSTOM,
+                file_name="custom_definitions.json",
+            )
+        else:
+            result = await self._export_json_picker.save_file(
+                dialog_title="定義を JSON でエクスポート",
+                allowed_extensions=["json"],
+                file_type=ft.FilePickerFileType.CUSTOM,
+                file_name="custom_definitions.json",
+            )
+            if result:
+                self._handle_export_def_json(result)
+
+    def _on_export_json_picked(self, e) -> None:
+        """Legacy callback"""
+        if not e.path:
+            return
+        self._handle_export_def_json(e.path)
+
+    def _handle_export_def_json(self, path) -> None:
+        output_path = path if isinstance(path, str) else path.path
+        if not output_path.endswith(".json"):
+            output_path += ".json"
+        try:
+            count = self._dbc_loader.export_all_json(output_path)
+            self._show_snackbar(f"JSON エクスポート完了: {count} メッセージ → {Path(output_path).name}")
+        except Exception as ex:
+            self._show_snackbar(f"JSON エクスポートエラー: {ex}")
+        self.page.update()
+
+    async def _on_export_def_dbc(self, e) -> None:
+        """定義エクスポート → DBC"""
+        if not self._dbc_loader.loaded_files and not self._dbc_loader.custom_files:
+            self._show_snackbar("DB が読み込まれていません")
+            return
+        if _FLET_LEGACY:
+            self._export_dbc_picker.save_file(
+                dialog_title="定義を DBC でエクスポート",
+                allowed_extensions=["dbc"],
+                file_type=ft.FilePickerFileType.CUSTOM,
+                file_name="exported.dbc",
+            )
+        else:
+            result = await self._export_dbc_picker.save_file(
+                dialog_title="定義を DBC でエクスポート",
+                allowed_extensions=["dbc"],
+                file_type=ft.FilePickerFileType.CUSTOM,
+                file_name="exported.dbc",
+            )
+            if result:
+                self._handle_export_def_dbc(result)
+
+    def _on_export_dbc_picked(self, e) -> None:
+        """Legacy callback"""
+        if not e.path:
+            return
+        self._handle_export_def_dbc(e.path)
+
+    def _handle_export_def_dbc(self, path) -> None:
+        output_path = path if isinstance(path, str) else path.path
+        if not output_path.endswith(".dbc"):
+            output_path += ".dbc"
+        try:
+            count = self._dbc_loader.export_dbc(output_path)
+            self._show_snackbar(f"DBC エクスポート完了: {count} メッセージ → {Path(output_path).name}")
+        except Exception as ex:
+            self._show_snackbar(f"DBC エクスポートエラー: {ex}")
+        self.page.update()
+
+    async def _on_export_def_arxml(self, e) -> None:
+        """定義エクスポート → ARXML"""
+        if not self._dbc_loader.loaded_files and not self._dbc_loader.custom_files:
+            self._show_snackbar("DB が読み込まれていません")
+            return
+        if _FLET_LEGACY:
+            self._export_arxml_picker.save_file(
+                dialog_title="定義を ARXML でエクスポート",
+                allowed_extensions=["arxml"],
+                file_type=ft.FilePickerFileType.CUSTOM,
+                file_name="exported.arxml",
+            )
+        else:
+            result = await self._export_arxml_picker.save_file(
+                dialog_title="定義を ARXML でエクスポート",
+                allowed_extensions=["arxml"],
+                file_type=ft.FilePickerFileType.CUSTOM,
+                file_name="exported.arxml",
+            )
+            if result:
+                self._handle_export_def_arxml(result)
+
+    def _on_export_arxml_picked(self, e) -> None:
+        """Legacy callback"""
+        if not e.path:
+            return
+        self._handle_export_def_arxml(e.path)
+
+    def _handle_export_def_arxml(self, path) -> None:
+        output_path = path if isinstance(path, str) else path.path
+        if not output_path.endswith(".arxml"):
+            output_path += ".arxml"
+        try:
+            count = self._dbc_loader.export_arxml(output_path)
+            self._show_snackbar(f"ARXML エクスポート完了: {count} メッセージ → {Path(output_path).name}")
+        except Exception as ex:
+            self._show_snackbar(f"ARXML エクスポートエラー: {ex}")
+        self.page.update()
+
     def _on_export_path_picked(self, e) -> None:
         """Legacy callback (Flet <=0.28)"""
         if not e.path:
@@ -579,14 +798,15 @@ class MainWindow:
         """保存先が確定した時の共通処理"""
         if not output_path.lower().endswith(".png"):
             output_path += ".png"
-        fig = self._pending_png_figure
         self._pending_png_figure = None
-        if fig is None:
-            self._show_snackbar("保存対象のグラフがありません")
-            return
         try:
-            # kaleido 経由で PNG を書き出す（scale=2 で高解像度）
-            fig.write_image(output_path, format="png", width=1600, height=900, scale=2)
+            # kaleido が Python 3.13 でハングするため matplotlib で PNG を生成
+            png_bytes = self._graph_panel.render_png_bytes_for_save(dpi=200)
+            if png_bytes is None:
+                self._show_snackbar("保存対象のグラフがありません")
+                return
+            with open(output_path, "wb") as f:
+                f.write(png_bytes)
             self._show_snackbar(f"PNG 保存完了: {Path(output_path).name}")
         except Exception as ex:
             self._show_snackbar(f"PNG 保存エラー: {ex}")

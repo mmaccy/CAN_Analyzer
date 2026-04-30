@@ -3,20 +3,17 @@
 選択シグナルの値を時系列グラフで表示する。
 
 描画方式:
-- アプリ内: `PlotlyChart` (kaleido 経由の静的 SVG)。軽量で常時表示に向く。
-  表示されるだけの ModeBar 残骸は `modebar=dict(remove=['all'])` で抑止。
+- kaleido が Python 3.13 でハングするため、アプリ内には静的プレビュー画像
+  (Plotly の to_image に依存しない軽量 matplotlib SVG) を表示する。
 - フル機能 (ズーム/パン/リセット/ホバー情報表示等): 「ブラウザで開く」ボタン
   押下時に Plotly 自己完結 HTML を一時ファイルに書き出し、`webbrowser.open`
   で既定ブラウザに表示。
-  Windows デスクトップの Flet WebView が未対応 (0.84 時点) のため、この構成を採用。
-- PNG 保存は引き続き `fig.write_image` (kaleido) で高解像度書き出し。
+- PNG 保存はグラフの matplotlib 版を使用。
 """
 
+import io
+import base64
 import flet as ft
-try:
-    from flet.plotly_chart import PlotlyChart
-except ModuleNotFoundError:
-    from flet_charts.plotly_chart import PlotlyChart
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import plotly.graph_objects as go
@@ -196,8 +193,19 @@ class GraphPanel(ft.Column):
                 return self._dbc_loader.is_signal_non_negative(fid, sname)
         return False
 
+    def _value_labels_lookup(self, signal_name: str) -> Optional[Dict[float, str]]:
+        """シグナル名から ARXML/DBC Value Table を返す ({Y値: ラベル})"""
+        if self._dbc_loader is None:
+            return None
+        for fid, sname in self._selected_signals:
+            if sname == signal_name:
+                return self._dbc_loader.get_signal_value_labels(
+                    fid, sname, use_physical=self._use_physical,
+                )
+        return None
+
     def _rebuild_chart(self) -> None:
-        """グラフを再構築する (アプリ内は静的 SVG)"""
+        """グラフを再構築する (アプリ内は matplotlib SVG プレビュー)"""
         if not self._selected_signals or not self._dbc_loader or not self._frames:
             self._chart = None
             self._current_figure = None
@@ -223,6 +231,7 @@ class GraphPanel(ft.Column):
                 self._reset_highlight_btn.visible = False
                 return
 
+            # Plotly figure を生成 (ブラウザ表示・PNG 保存用)
             if self._use_subplot:
                 fig = build_subplot_graph(
                     signal_data,
@@ -231,6 +240,7 @@ class GraphPanel(ft.Column):
                     highlighted=self._highlighted or None,
                     x_range=self._time_range,
                     non_negative_lookup=self._non_negative_lookup,
+                    value_labels_lookup=self._value_labels_lookup,
                 )
             else:
                 fig = build_overlay_graph(
@@ -240,15 +250,40 @@ class GraphPanel(ft.Column):
                     highlighted=self._highlighted or None,
                     x_range=self._time_range,
                     non_negative_lookup=self._non_negative_lookup,
+                    value_labels_lookup=self._value_labels_lookup,
                 )
 
-            # 静的 SVG では操作不能な ModeBar は非表示にする
-            # （インタラクティブ操作は「ブラウザで開く」ボタンで提供）
-            fig.update_layout(modebar=dict(remove=["all"]))
+            self._current_figure = fig  # ブラウザ表示・PNG保存用に保持
 
-            self._current_figure = fig  # PNG 保存・ブラウザ表示用に保持
-            self._chart = PlotlyChart(figure=fig, expand=True)
-            self._chart_container.content = self._chart
+            # --- アプリ内プレビュー: matplotlib で軽量 PNG 生成 ---
+            svg_data = self._render_matplotlib_preview(signal_data)
+            if svg_data:
+                _fit = ft.ImageFit.CONTAIN if hasattr(ft, "ImageFit") else ft.BoxFit.CONTAIN
+                b64 = base64.b64encode(svg_data).decode("ascii")
+                # Flet 0.84+: src_base64 廃止 → src に data URI を設定
+                if hasattr(ft.Image, "src_base64"):
+                    self._chart = ft.Image(src_base64=b64, fit=_fit, expand=True)
+                else:
+                    self._chart = ft.Image(src=f"data:image/png;base64,{b64}", fit=_fit, expand=True)
+                self._chart_container.content = self._chart
+            else:
+                # matplotlib が無い場合はテキスト情報のみ表示
+                info_lines = [f"  {name}: {len(vals)} points" for name, vals in signal_data.items()]
+                self._chart_container.content = ft.Container(
+                    content=ft.Column(
+                        controls=[
+                            ft.Text(
+                                "グラフデータ準備完了 — 「ブラウザで開く」でインタラクティブ表示",
+                                size=13, weight=ft.FontWeight.W_500,
+                            ),
+                            ft.Text("\n".join(info_lines), size=11, font_family="Consolas"),
+                        ],
+                        spacing=8,
+                    ),
+                    padding=12,
+                    alignment=ft.Alignment(0, 0),
+                    expand=True,
+                )
 
             self._rebuild_legend(list(signal_data.keys()))
         except Exception as ex:
@@ -275,6 +310,151 @@ class GraphPanel(ft.Column):
             )
             self._legend_container.visible = False
             self._reset_highlight_btn.visible = False
+
+    def _render_matplotlib_preview(self, signal_data: Dict[str, List[SignalValue]]) -> Optional[bytes]:
+        """matplotlib を使ってアプリ内プレビュー用の PNG バイト列を生成する。
+
+        Plotly 版 (graph_builder) と同じデータ処理ロジック (_prepare_series) を使い、
+        階段状 (step) 描画・ギャップ分断を再現する。
+        """
+        return self._render_matplotlib_png(signal_data, dpi=120)
+
+    def render_png_bytes_for_save(self, dpi: int = 200) -> Optional[bytes]:
+        """PNG ファイル保存用の高解像度 PNG バイト列を生成する。
+
+        kaleido が Python 3.13 でハングするため、matplotlib で描画する。
+        プレビュー用 (_render_matplotlib_preview) と同じロジックだが DPI を上げる。
+        """
+        if not self._selected_signals or not self._dbc_loader or not self._frames:
+            return None
+        signal_data = self._collect_signal_data()
+        if not signal_data:
+            return None
+        return self._render_matplotlib_png(signal_data, dpi=dpi)
+
+    def _render_matplotlib_png(
+        self, signal_data: Dict[str, List[SignalValue]], dpi: int = 120,
+    ) -> Optional[bytes]:
+        """matplotlib で PNG バイト列を生成する共通実装。"""
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import numpy as np
+        except ImportError:
+            return None
+
+        from analysis.graph_builder import _prepare_series
+
+        names = list(signal_data.keys())
+        n_signals = len(names)
+        if n_signals == 0:
+            return None
+
+        def _plot_signal(ax, name, vals, color, alpha):
+            cycle_ms = self._cycle_time_lookup(name)
+            ts, ys = _prepare_series(vals, self._use_physical, cycle_ms)
+            # _prepare_series がギャップ箇所に None を返す。
+            # matplotlib step(where="post") は NaN を含む点の x 座標まで
+            # 前の値の水平線を延長してしまうため、Plotly の connectgaps=False
+            # のように完全にラインを分断できない。
+            # → None の位置でセグメント分割し、各セグメントを個別に描画する。
+            segments: list[tuple[list, list]] = []
+            seg_ts: list[float] = []
+            seg_ys: list[float] = []
+            for t, y in zip(ts, ys):
+                if y is None:
+                    if seg_ts:
+                        segments.append((seg_ts, seg_ys))
+                        seg_ts = []
+                        seg_ys = []
+                else:
+                    seg_ts.append(t)
+                    seg_ys.append(y)
+            if seg_ts:
+                segments.append((seg_ts, seg_ys))
+            for i, (s_ts, s_ys) in enumerate(segments):
+                ax.step(s_ts, np.array(s_ys, dtype=float),
+                        where="post", color=color,
+                        linewidth=1.0, alpha=alpha,
+                        label=name if i == 0 else None)
+
+        def _apply_value_labels(ax, name):
+            """Value Table が定義されていれば Y 軸ティックにラベルを設定する"""
+            labels = self._value_labels_lookup(name)
+            if not labels:
+                return
+            tick_vals = sorted(labels.keys())
+            tick_texts = [f"{v:g} = {labels[v]}" for v in tick_vals]
+            ax.set_yticks(tick_vals)
+            ax.set_yticklabels(tick_texts)
+            # Y 軸範囲を値定義の範囲に合わせて見やすくする
+            if len(tick_vals) >= 2:
+                span = tick_vals[-1] - tick_vals[0]
+                padding = max(span * 0.15, 0.5)
+                ax.set_ylim(tick_vals[0] - padding, tick_vals[-1] + padding)
+            elif len(tick_vals) == 1:
+                ax.set_ylim(tick_vals[0] - 1, tick_vals[0] + 1)
+
+        if self._use_subplot and n_signals > 1:
+            fig, axes = plt.subplots(n_signals, 1, sharex=True, figsize=(10, 2.5 * n_signals))
+            if n_signals == 1:
+                axes = [axes]
+            for i, name in enumerate(names):
+                vals = signal_data[name]
+                color = _PLOTLY_COLORS[i % len(_PLOTLY_COLORS)]
+                alpha = 1.0 if (not self._highlighted or name in self._highlighted) else 0.15
+                _plot_signal(axes[i], name, vals, color, alpha)
+                unit = vals[0].unit if vals and vals[0].unit else ""
+                axes[i].set_ylabel(f"{name}\n[{unit}]" if unit else name, fontsize=8)
+                axes[i].tick_params(labelsize=7)
+                axes[i].grid(True, alpha=0.3)
+                # Value Table があれば Y 軸ラベルに値定義を表示
+                _apply_value_labels(axes[i], name)
+                # Value Table が無い場合のみ non_negative を適用
+                if not self._value_labels_lookup(name):
+                    if self._non_negative_lookup(name):
+                        axes[i].set_ylim(bottom=0)
+            axes[-1].set_xlabel("Time [s]", fontsize=9)
+        else:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            for i, name in enumerate(names):
+                vals = signal_data[name]
+                color = _PLOTLY_COLORS[i % len(_PLOTLY_COLORS)]
+                alpha = 1.0 if (not self._highlighted or name in self._highlighted) else 0.15
+                _plot_signal(ax, name, vals, color, alpha)
+            ax.set_xlabel("Time [s]", fontsize=9)
+            ax.set_ylabel("Value" + (" [physical]" if self._use_physical else " [raw]"), fontsize=9)
+            ax.legend(fontsize=8, loc="upper right")
+            ax.tick_params(labelsize=7)
+            ax.grid(True, alpha=0.3)
+            # オーバーレイ時: 単一シグナルなら Value Table 適用
+            if n_signals == 1:
+                _apply_value_labels(ax, names[0])
+
+        # X軸をASC全体の時間範囲に合わせる
+        if self._time_range and self._time_range[0] < self._time_range[1]:
+            plt.xlim(self._time_range)
+
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
+    def render_png_bytes_for_save(self, dpi: int = 200) -> Optional[bytes]:
+        """PNG ファイル保存用の高解像度 PNG バイト列を生成する。
+
+        kaleido が Python 3.13 でハングするため、matplotlib で描画する。
+        プレビュー用 (_render_matplotlib_preview) と同じロジックだが DPI を上げる。
+        """
+        if not self._selected_signals or not self._dbc_loader or not self._frames:
+            return None
+        signal_data = self._collect_signal_data()
+        if not signal_data:
+            return None
+        return self._render_matplotlib_png(signal_data, dpi=dpi)
 
     def _rebuild_legend(self, signal_names: List[str]) -> None:
         """凡例チップ列を再構築する"""
