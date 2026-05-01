@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import can; print\\(can.__version__\\)\")"
+    ]
+  }
+}

@@ -1,11 +1,12 @@
 """統計パネル — フレーム統計テーブル + バスロードグラフ"""
 
+import csv
 import flet as ft
 try:
     from flet.plotly_chart import PlotlyChart
 except ModuleNotFoundError:
     from flet_charts.plotly_chart import PlotlyChart
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from models.can_frame import CanFrame
 from models.signal_value import FrameStatistics
@@ -13,13 +14,43 @@ from analysis.statistics import compute_frame_statistics, compute_bus_load
 from analysis.graph_builder import build_bus_load_graph
 
 
+def write_statistics_csv(stats: List[FrameStatistics], output_path: str) -> int:
+    """統計情報を CSV に書き出す。
+
+    Returns:
+        書き出した行数（ヘッダ除く）
+    """
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "ID(hex)", "Name", "Channel", "Count",
+            "AvgCycle(ms)", "MinCycle(ms)", "MaxCycle(ms)", "StdDev(ms)",
+            "FirstTime(s)", "LastTime(s)",
+        ])
+        for s in stats:
+            writer.writerow([
+                f"0x{s.arbitration_id:X}",
+                s.frame_name or "",
+                s.channel,
+                s.count,
+                f"{s.cycle_avg_ms:.6f}",
+                f"{s.cycle_min_ms:.6f}",
+                f"{s.cycle_max_ms:.6f}",
+                f"{s.cycle_std_ms:.6f}",
+                f"{s.first_timestamp:.6f}",
+                f"{s.last_timestamp:.6f}",
+            ])
+    return len(stats)
+
+
 class StatisticsPanel(ft.Column):
     """統計情報パネル"""
 
-    def __init__(self):
+    def __init__(self, on_request_csv_save: Optional[Callable[[], None]] = None):
         super().__init__(expand=True, spacing=0)
         self._frames: List[CanFrame] = []
         self._stats: List[FrameStatistics] = []
+        self._on_request_csv_save = on_request_csv_save
 
         # 統計テーブル
         self._stats_table = ft.DataTable(
@@ -47,6 +78,12 @@ class StatisticsPanel(ft.Column):
             icon=ft.Icons.REFRESH,
             on_click=self._on_refresh,
         )
+        self._csv_btn = ft.ElevatedButton(
+            "CSV エクスポート",
+            icon=ft.Icons.SAVE_ALT,
+            on_click=self._on_csv_click,
+            tooltip="統計テーブルを CSV で保存",
+        )
 
         table_scroll = ft.Container(
             content=ft.Column(
@@ -59,7 +96,11 @@ class StatisticsPanel(ft.Column):
 
         self.controls = [
             ft.Container(
-                content=ft.Row([self._refresh_btn], alignment=ft.MainAxisAlignment.START),
+                content=ft.Row(
+                    [self._refresh_btn, self._csv_btn],
+                    alignment=ft.MainAxisAlignment.START,
+                    spacing=8,
+                ),
                 padding=ft.padding.symmetric(horizontal=8, vertical=4),
             ),
             table_scroll,
@@ -111,3 +152,14 @@ class StatisticsPanel(ft.Column):
     def _on_refresh(self, e=None) -> None:
         self.refresh()
         self.update()
+
+    def _on_csv_click(self, e=None) -> None:
+        if self._on_request_csv_save is not None:
+            self._on_request_csv_save()
+
+    def get_stats(self) -> List[FrameStatistics]:
+        """現在計算済みの統計（更新ボタン押下後の値）を返す。
+        まだ計算していなければ算出してから返す。"""
+        if not self._stats and self._frames:
+            self._stats = compute_frame_statistics(self._frames)
+        return self._stats

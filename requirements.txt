@@ -6,3 +6,5 @@ plotly>=5.18.0
 kaleido>=1.0.0
 cantools>=39.0.0
 python-can>=4.3.0
+# 必須: アプリ内グラフプレビュー用 (kaleido が Py 3.13+ でハングするため matplotlib に移行)
+matplotlib>=3.7

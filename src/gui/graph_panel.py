@@ -43,9 +43,19 @@ _BROWSER_PLOTLY_CONFIG = {
 class GraphPanel(ft.Column):
     """時系列グラフパネル"""
 
+    # アプリ内 SVG クリック→時刻逆算用の固定マージン (figure 座標)
+    # subplots_adjust で軸位置を固定すると、画像内での axes 矩形の比率が
+    # 全レンダで一定になるため、クリック座標から時刻への逆変換が安定する。
+    _AXES_LEFT_FRAC = 0.08
+    _AXES_RIGHT_FRAC = 0.98
+    _AXES_TOP_FRAC = 0.95
+    _AXES_BOTTOM_FRAC = 0.10
+
     def __init__(
         self,
         on_request_png_save: Optional[Callable[[go.Figure, Optional[str]], None]] = None,
+        on_chart_time_clicked: Optional[Callable[[float], None]] = None,
+        on_request_browser_open: Optional[Callable[[go.Figure], Optional[str]]] = None,
     ):
         """
         Args:
@@ -53,6 +63,9 @@ class GraphPanel(ft.Column):
                 `(figure, signal_name_hint)` の 2 引数で、単一シグナル選択時のみ
                 `signal_name_hint` にそのシグナル名が入る（それ以外は None）。
                 呼び出し側でファイル名生成と保存ダイアログを扱う。
+            on_chart_time_clicked: アプリ内グラフ・ブラウザ Plotly いずれかで
+                プロット領域をクリックした際に呼ばれるコールバック。引数は秒単位の時刻。
+                main_window 側で TracePanel のジャンプに転送する想定。
         """
         super().__init__(expand=True, spacing=0)
         self._frames: List[CanFrame] = []
@@ -67,8 +80,16 @@ class GraphPanel(ft.Column):
         # 現在のグラフ figure（PNG エクスポート用に保持）
         self._current_figure: Optional[go.Figure] = None
         self._on_request_png_save = on_request_png_save
+        self._on_chart_time_clicked = on_chart_time_clicked
+        self._on_request_browser_open = on_request_browser_open
         # ASC 全体の時間範囲 (X 軸既定値用)
         self._time_range: Optional[Tuple[float, float]] = None
+        # トレース → グラフのカーソル同期 (赤縦線)
+        self._cursor_time: Optional[float] = None
+        # クリック→時刻逆算用に保持する現在の X 軸データ範囲
+        self._click_x_range: Optional[Tuple[float, float]] = None
+        # GestureDetector の表示幅 (page.on_resized で更新)
+        self._chart_display_width: float = 1000.0
 
         # ツールバー
         self._physical_toggle = ft.Switch(
@@ -137,11 +158,18 @@ class GraphPanel(ft.Column):
             expand=True,
             alignment=ft.Alignment(0, 0),
         )
+        # GestureDetector で包んでクリック→時刻ジャンプを実現 (Plan A)
+        self._chart_gesture = ft.GestureDetector(
+            content=self._chart_container,
+            on_tap_down=self._on_chart_tap_down,
+            mouse_cursor=ft.MouseCursor.CLICK,
+            expand=True,
+        )
 
         self.controls = [
             ft.Container(content=toolbar, padding=ft.padding.symmetric(horizontal=8, vertical=4)),
             self._legend_container,
-            self._chart_container,
+            self._chart_gesture,
         ]
 
     def set_data(self, frames: List[CanFrame], dbc_loader: Optional[DbcLoader]) -> None:
@@ -172,6 +200,88 @@ class GraphPanel(ft.Column):
         self._highlighted &= current_names
         self._rebuild_chart()
         self.update()
+
+    def add_frames(self, frames: List[CanFrame]) -> None:
+        """リアルタイム受信用: フレームをバッチで追記する
+
+        - `_frames` および `_frames_by_id` を更新
+        - `_time_range` を新規受信フレームに合わせて拡張
+        - 再描画は呼ばない（コスト高のため main_window 側で 1Hz 程度に間引く）
+        """
+        if not frames:
+            return
+        self._frames.extend(frames)
+        for f in frames:
+            self._frames_by_id.setdefault(f.arbitration_id, []).append(f)
+
+        ts_min = min(f.timestamp for f in frames)
+        ts_max = max(f.timestamp for f in frames)
+        if self._time_range is None:
+            self._time_range = (ts_min, ts_max)
+        else:
+            cur_min, cur_max = self._time_range
+            self._time_range = (min(cur_min, ts_min), max(cur_max, ts_max))
+
+    def refresh_live(self) -> None:
+        """リアルタイムモード用の再描画。選択シグナルが無ければ何もしない"""
+        if not self._selected_signals:
+            return
+        try:
+            self._rebuild_chart()
+            self.update()
+        except Exception:
+            # 再描画失敗時はスキップ（次回ループで再試行）
+            pass
+
+    def set_cursor_time(self, t: Optional[float]) -> None:
+        """トレース選択行のタイムスタンプをグラフ上のカーソル (赤縦線) として表示
+
+        トレース → グラフ方向のカーソル同期 (Phase 4)。`None` で解除。
+        選択シグナルが無い場合や時刻が変わっていない場合は再描画しない。
+        """
+        if self._cursor_time == t:
+            return
+        self._cursor_time = t
+        if not self._selected_signals or not self._frames:
+            return
+        try:
+            self._rebuild_chart()
+            self.update()
+        except (AssertionError, RuntimeError):
+            # ページ未アタッチ時の update 失敗は無視
+            pass
+
+    def notify_chart_width(self, width: float) -> None:
+        """グラフ表示幅を更新する (page.on_resized から呼ぶ)
+
+        GestureDetector の `local_x` は表示中のジェスチャ領域に対するピクセル位置だが、
+        Flet は実行時サイズを直接取得できないため、ページリサイズ時の幅から逆算する。
+        """
+        if width > 0:
+            self._chart_display_width = float(width)
+
+    def _on_chart_tap_down(self, e) -> None:
+        """グラフ上のクリックを時刻に逆算し、コールバックでトレースジャンプを要求"""
+        if self._on_chart_time_clicked is None or self._click_x_range is None:
+            return
+        local_x = float(getattr(e, "local_x", 0) or 0)
+        if local_x <= 0 or self._chart_display_width <= 0:
+            return
+        # GestureDetector の表示幅に対する相対位置 (0..1)
+        ratio = local_x / self._chart_display_width
+        if ratio < self._AXES_LEFT_FRAC or ratio > self._AXES_RIGHT_FRAC:
+            # axes 領域の外（左マージン or 右マージン）はジャンプ対象外
+            return
+        axes_ratio = (
+            (ratio - self._AXES_LEFT_FRAC)
+            / (self._AXES_RIGHT_FRAC - self._AXES_LEFT_FRAC)
+        )
+        t_min, t_max = self._click_x_range
+        target_time = t_min + axes_ratio * (t_max - t_min)
+        try:
+            self._on_chart_time_clicked(target_time)
+        except Exception:
+            pass
 
     def _cycle_time_lookup(self, signal_name: str) -> Optional[float]:
         """シグナル名から DBC/ARXML 定義の送信周期(ms)を返す"""
@@ -253,6 +363,17 @@ class GraphPanel(ft.Column):
                     value_labels_lookup=self._value_labels_lookup,
                 )
 
+            # ブラウザ表示・PNG保存用にカーソル線も焼き込む
+            if self._cursor_time is not None:
+                try:
+                    fig.add_vline(
+                        x=self._cursor_time,
+                        line=dict(color="#D32F2F", width=1.2),
+                        opacity=0.8,
+                    )
+                except Exception:
+                    # subplot 等で add_vline が複数行に伝播しないケースを許容
+                    pass
             self._current_figure = fig  # ブラウザ表示・PNG保存用に保持
 
             # --- アプリ内プレビュー: matplotlib で軽量 PNG 生成 ---
@@ -267,18 +388,39 @@ class GraphPanel(ft.Column):
                     self._chart = ft.Image(src=f"data:image/png;base64,{b64}", fit=_fit, expand=True)
                 self._chart_container.content = self._chart
             else:
-                # matplotlib が無い場合はテキスト情報のみ表示
+                # matplotlib が無い場合はテキスト情報 + インストール案内のみ表示
                 info_lines = [f"  {name}: {len(vals)} points" for name, vals in signal_data.items()]
                 self._chart_container.content = ft.Container(
                     content=ft.Column(
                         controls=[
                             ft.Text(
-                                "グラフデータ準備完了 — 「ブラウザで開く」でインタラクティブ表示",
+                                "アプリ内プレビューには matplotlib が必要です",
                                 size=13, weight=ft.FontWeight.W_500,
+                                color=ft.Colors.ERROR,
                             ),
+                            ft.Text(
+                                "次のコマンドでインストール後、アプリを再起動してください:",
+                                size=11,
+                            ),
+                            ft.Container(
+                                content=ft.Text(
+                                    "pip install matplotlib",
+                                    size=11, font_family="Consolas",
+                                    selectable=True,
+                                ),
+                                bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
+                                padding=6,
+                            ),
+                            ft.Text(
+                                "（暫定対応として「ブラウザで開く」🔗 ボタンでインタラクティブ表示が利用できます）",
+                                size=10, italic=True,
+                                color=ft.Colors.ON_SURFACE_VARIANT,
+                            ),
+                            ft.Divider(height=8),
+                            ft.Text("選択中シグナル:", size=11, weight=ft.FontWeight.W_500),
                             ft.Text("\n".join(info_lines), size=11, font_family="Consolas"),
                         ],
-                        spacing=8,
+                        spacing=6,
                     ),
                     padding=12,
                     alignment=ft.Alignment(0, 0),
@@ -396,10 +538,12 @@ class GraphPanel(ft.Column):
             elif len(tick_vals) == 1:
                 ax.set_ylim(tick_vals[0] - 1, tick_vals[0] + 1)
 
+        all_axes: List = []  # カーソル線描画ターゲット（subplot/overlay 共通で参照する）
         if self._use_subplot and n_signals > 1:
             fig, axes = plt.subplots(n_signals, 1, sharex=True, figsize=(10, 2.5 * n_signals))
             if n_signals == 1:
                 axes = [axes]
+            all_axes = list(axes)
             for i, name in enumerate(names):
                 vals = signal_data[name]
                 color = _PLOTLY_COLORS[i % len(_PLOTLY_COLORS)]
@@ -418,6 +562,7 @@ class GraphPanel(ft.Column):
             axes[-1].set_xlabel("Time [s]", fontsize=9)
         else:
             fig, ax = plt.subplots(figsize=(10, 5))
+            all_axes = [ax]
             for i, name in enumerate(names):
                 vals = signal_data[name]
                 color = _PLOTLY_COLORS[i % len(_PLOTLY_COLORS)]
@@ -435,10 +580,36 @@ class GraphPanel(ft.Column):
         # X軸をASC全体の時間範囲に合わせる
         if self._time_range and self._time_range[0] < self._time_range[1]:
             plt.xlim(self._time_range)
+            # クリック→時刻逆算用に X 軸範囲を保持
+            self._click_x_range = self._time_range
+        else:
+            # フォールバック: 実データから min/max を算出
+            ts_all = [v.timestamp for vals in signal_data.values() for v in vals]
+            if ts_all:
+                self._click_x_range = (min(ts_all), max(ts_all))
 
-        fig.tight_layout()
+        # トレース → グラフのカーソル同期 (赤縦線)
+        if self._cursor_time is not None:
+            for cax in all_axes:
+                cax.axvline(
+                    self._cursor_time,
+                    color="#D32F2F",
+                    linewidth=0.9,
+                    alpha=0.8,
+                    zorder=5,
+                )
+
+        # クリック→時刻逆算を安定させるため、subplots_adjust で axes 位置を固定する。
+        # tight_layout / bbox_inches="tight" は描画ごとに座標が変動するため使わない。
+        fig.subplots_adjust(
+            left=self._AXES_LEFT_FRAC,
+            right=self._AXES_RIGHT_FRAC,
+            top=self._AXES_TOP_FRAC,
+            bottom=self._AXES_BOTTOM_FRAC,
+            hspace=0.25,
+        )
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+        fig.savefig(buf, format="png", dpi=dpi)
         plt.close(fig)
         buf.seek(0)
         return buf.read()
@@ -568,22 +739,34 @@ class GraphPanel(ft.Column):
         self._on_request_png_save(self._current_figure, signal_hint)
 
     def _on_open_in_browser(self, e) -> None:
-        """ブラウザで開くボタン: フル機能版 Plotly を既定ブラウザで表示"""
+        """ブラウザで開くボタン: フル機能版 Plotly を既定ブラウザで表示
+
+        on_request_browser_open コールバックが設定されていればローカル HTTP
+        サーバ経由で開き、Plotly のクリックを Flet 側に中継する (Plan B)。
+        未設定時は従来通り tempfile + file:// URI で開く。
+        """
         if self._current_figure is None:
             self._show_snackbar("表示するグラフがありません。先にシグナルを選択してください。")
             return
         try:
-            import tempfile
             import webbrowser
             from pathlib import Path
 
-            # インタラクティブ HTML を生成 (plotly.js を CDN ではなく inline で同梱)
+            # クリック中継サーバ経由で開く (Plan B)
+            if self._on_request_browser_open is not None:
+                url = self._on_request_browser_open(self._current_figure)
+                if url:
+                    webbrowser.open(url)
+                    return
+                # サーバ起動失敗時は file:// フォールバック
+
+            # フォールバック: tempfile + file:// (クリック→トレースジャンプは効かない)
+            import tempfile
             html = self._current_figure.to_html(
                 include_plotlyjs="inline",
                 full_html=True,
                 config=_BROWSER_PLOTLY_CONFIG,
             )
-            # 一時ファイルに書き出してブラウザで開く
             tmp = tempfile.NamedTemporaryFile(
                 prefix="can_graph_", suffix=".html", delete=False, mode="w", encoding="utf-8"
             )

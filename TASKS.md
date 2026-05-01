@@ -28,12 +28,14 @@
 
 ## Phase 3: リアルタイム CAN 受信
 
-- [ ] python-can Vector インターフェース接続
-- [ ] 接続設定ダイアログ
-- [ ] リアルタイムトレースビュー
-- [ ] リアルタイムログ記録 (ASC 出力)
-- [ ] リアルタイムデコード表示
-- [ ] リアルタイムグラフ表示
+- [x] python-can Vector / Virtual インターフェース接続 (`realtime/can_receiver.py`)
+- [x] 接続設定ダイアログ (`gui/connection_dialog.py`)
+- [x] リアルタイムトレースビュー (`TracePanel.add_frames`)
+- [x] リアルタイムログ記録 (ASC 出力 — `asc_writer.format_frame_as_asc`)
+- [x] リアルタイムデコード表示 (既存トレース選択行のシグナルデコードを流用)
+- [x] リアルタイムグラフ表示 (`GraphPanel.add_frames` + `refresh_live()` を 1Hz 再描画)
+- [x] 受信フィルタ (RT-4: `TracePanel.add_frames` 内で `_frame_matches_filter` 適用済み)
+- [ ] Vector 実機での結合テスト (要 XL Driver / VN1610)
 
 ## Phase 2.5: グラフ・ツリー UX 改善
 
@@ -44,9 +46,9 @@
 
 ## Phase 4: 品質向上
 
-- [ ] 単体テスト整備
-- [ ] カーソル同期 (グラフ ↔ トレース)
-- [ ] Value Table デコード
-- [ ] 統計 CSV エクスポート
-- [ ] キーボードショートカット
-- [ ] エラーハンドリング改善
+- [x] 単体テスト整備 (`tests/test_asc_writer_format.py`, `test_can_receiver.py`, `test_click_server.py`, `test_dbc_loader.py`, `test_statistics.py`, `test_logger.py` — 全 31 テスト)
+- [x] カーソル同期: 双方向。トレース→グラフは赤縦線、グラフ→トレースは アプリ内 SVG クリック (`GestureDetector`) と ブラウザ Plotly クリック (`utils/click_server.py` 経由) の両方で時刻ジャンプ
+- [x] Value Table デコード (`SignalValue.choice_text`、トレース詳細パネルで `数値 (ラベル)` 形式表示)
+- [x] 統計 CSV エクスポート (`statistics_panel.write_statistics_csv` + UI ボタン)
+- [x] キーボードショートカット (`MainWindow._on_keyboard_event` — Ctrl+O/D/E/S/L/K, Ctrl+Shift+E/K, Ctrl+1/2/3, F5)
+- [x] エラーハンドリング改善 (`utils/logger.py` 集約ロガー + `_show_error()` ヘルパ + ツールバーから「ログを開く」ボタン)
