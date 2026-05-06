@@ -3,6 +3,7 @@
 シグナルの時系列グラフを Plotly で生成する。
 """
 
+import logging
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import plotly.graph_objects as go
@@ -10,6 +11,7 @@ from plotly.subplots import make_subplots
 
 from models.signal_value import SignalValue
 
+_log = logging.getLogger(__name__)
 
 # 送信周期の何倍以上の間隔でフレームが来なかった区間を「途絶」として線を切るか
 GAP_MULTIPLIER = 5.0
@@ -30,6 +32,11 @@ def _prepare_series(
     """
     sorted_vals = sorted(values, key=lambda v: v.timestamp)
     if cycle_time_ms is None or cycle_time_ms <= 0:
+        _log.info(
+            "GRP-12: signal=%s cycle_time_ms=%s → ギャップ検出スキップ (周期未定義)",
+            sorted_vals[0].signal_name if sorted_vals else "?",
+            cycle_time_ms,
+        )
         times = [v.timestamp for v in sorted_vals]
         y_vals = [
             (v.physical_value if use_physical else v.raw_value)
@@ -41,14 +48,24 @@ def _prepare_series(
     times: List[float] = []
     y_vals: List[Optional[float]] = []
     prev_t: Optional[float] = None
+    gap_count = 0
     for v in sorted_vals:
         if prev_t is not None and (v.timestamp - prev_t) > gap_threshold_sec:
             # ギャップ位置に None を挿入してラインを分断
             times.append(v.timestamp)
             y_vals.append(None)
+            gap_count += 1
         times.append(v.timestamp)
         y_vals.append(v.physical_value if use_physical else v.raw_value)
         prev_t = v.timestamp
+    _log.info(
+        "GRP-12: signal=%s cycle_time_ms=%.1f threshold=%.3fs gaps=%d points=%d",
+        sorted_vals[0].signal_name if sorted_vals else "?",
+        cycle_time_ms,
+        gap_threshold_sec,
+        gap_count,
+        len(sorted_vals),
+    )
     return times, y_vals
 
 
@@ -67,6 +84,7 @@ def build_overlay_graph(
     highlighted: Optional[Set[str]] = None,
     x_range: Optional[Tuple[float, float]] = None,
     non_negative_lookup: Optional[Callable[[str], bool]] = None,
+    value_labels_lookup: Optional[Callable[[str], Optional[Dict[float, str]]]] = None,
 ) -> go.Figure:
     """複数シグナルを同一グラフ上にオーバーレイ表示する
 
@@ -81,6 +99,7 @@ def build_overlay_graph(
             ASC ファイル全体の範囲をデフォルトにすることで複数シグナル間の比較を容易にする。
         non_negative_lookup: signal_name が負値を取らないかを判定する関数。
             すべてのトレースが非負なら Y 軸の最小値を 0 に固定する。
+        value_labels_lookup: signal_name から Value Table {Y値: ラベル} を返す関数。
     """
     fig = go.Figure()
 
@@ -130,6 +149,21 @@ def build_overlay_graph(
         if all_non_neg:
             fig.update_yaxes(rangemode="tozero")
 
+    # Y 軸: 単一シグナルで Value Table が定義されていればティックラベルを設定
+    if value_labels_lookup and len(signal_data) == 1:
+        name = list(signal_data.keys())[0]
+        labels = value_labels_lookup(name)
+        if labels:
+            tick_vals = sorted(labels.keys())
+            tick_texts = [f"{v:g} = {labels[v]}" for v in tick_vals]
+            span = (tick_vals[-1] - tick_vals[0]) if len(tick_vals) >= 2 else 2
+            padding = max(span * 0.15, 0.5)
+            fig.update_yaxes(
+                tickvals=tick_vals,
+                ticktext=tick_texts,
+                range=[tick_vals[0] - padding, tick_vals[-1] + padding],
+            )
+
     return fig
 
 
@@ -141,6 +175,7 @@ def build_subplot_graph(
     highlighted: Optional[Set[str]] = None,
     x_range: Optional[Tuple[float, float]] = None,
     non_negative_lookup: Optional[Callable[[str], bool]] = None,
+    value_labels_lookup: Optional[Callable[[str], Optional[Dict[float, str]]]] = None,
 ) -> go.Figure:
     """シグナルごとにサブプロット（縦並び）で表示する"""
     names = list(signal_data.keys())
@@ -179,8 +214,21 @@ def build_subplot_graph(
             col=1,
         )
         y_kwargs = {"title_text": unit if unit else "Value"}
-        # サブプロット単位で非負判定。該当シグナルだけ min=0 に固定する。
-        if non_negative_lookup is not None and non_negative_lookup(name):
+        # Value Table が定義されていれば Y 軸ティックにラベルを設定
+        has_value_labels = False
+        if value_labels_lookup:
+            labels = value_labels_lookup(name)
+            if labels:
+                has_value_labels = True
+                tick_vals = sorted(labels.keys())
+                tick_texts = [f"{v:g} = {labels[v]}" for v in tick_vals]
+                span = (tick_vals[-1] - tick_vals[0]) if len(tick_vals) >= 2 else 2
+                padding = max(span * 0.15, 0.5)
+                y_kwargs["tickvals"] = tick_vals
+                y_kwargs["ticktext"] = tick_texts
+                y_kwargs["range"] = [tick_vals[0] - padding, tick_vals[-1] + padding]
+        # サブプロット単位で非負判定。Value Table が無い場合のみ適用。
+        if not has_value_labels and non_negative_lookup is not None and non_negative_lookup(name):
             y_kwargs["rangemode"] = "tozero"
         fig.update_yaxes(row=i, col=1, **y_kwargs)
 

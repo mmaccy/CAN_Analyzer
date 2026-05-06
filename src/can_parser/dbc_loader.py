@@ -11,6 +11,9 @@ import cantools
 
 from models.can_frame import CanFrame
 from models.signal_value import SignalValue
+from utils.logger import get_logger
+
+_log = get_logger(__name__)
 
 # 対応するデータベースファイル拡張子
 SUPPORTED_EXTENSIONS = {".dbc", ".arxml"}
@@ -22,10 +25,15 @@ class DbcLoader:
     def __init__(self):
         self._db = cantools.database.Database()
         self._loaded_files: List[str] = []
+        self._custom_files: List[str] = []
 
     @property
     def loaded_files(self) -> List[str]:
         return list(self._loaded_files)
+
+    @property
+    def custom_files(self) -> List[str]:
+        return list(self._custom_files)
 
     @property
     def messages(self) -> list:
@@ -45,10 +53,43 @@ class DbcLoader:
             )
         self._loaded_files.append(file_path)
 
+    def load_custom_file(self, file_path: str) -> int:
+        """カスタムシグナル定義 JSON を読み込み、DB に注入する。
+
+        Returns:
+            追加/置換されたメッセージ数
+        """
+        from can_parser.custom_definitions import load_custom_definitions
+        count = load_custom_definitions(file_path, self._db)
+        if count > 0:
+            self._custom_files.append(file_path)
+        return count
+
+    def export_message_json(self, frame_id: int, output_path: str) -> dict:
+        """既存メッセージ定義をカスタム JSON 形式でエクスポートする"""
+        from can_parser.custom_definitions import export_message_to_custom_json
+        return export_message_to_custom_json(self._db, frame_id, output_path)
+
+    def export_all_json(self, output_path: str) -> int:
+        """全メッセージ定義をカスタム JSON 形式でエクスポートする"""
+        from can_parser.custom_definitions import export_all_messages_to_json
+        return export_all_messages_to_json(self._db, output_path)
+
+    def export_dbc(self, output_path: str) -> int:
+        """全メッセージ定義を DBC 形式でエクスポートする"""
+        from can_parser.custom_definitions import export_db_as_dbc
+        return export_db_as_dbc(self._db, output_path)
+
+    def export_arxml(self, output_path: str) -> int:
+        """全メッセージ定義を ARXML 形式でエクスポートする"""
+        from can_parser.custom_definitions import export_db_as_arxml
+        return export_db_as_arxml(self._db, output_path)
+
     def clear(self) -> None:
         """読込済み DBC をクリアする"""
         self._db = cantools.database.Database()
         self._loaded_files.clear()
+        self._custom_files.clear()
 
     def get_frame_name(self, arbitration_id: int) -> Optional[str]:
         """フレーム ID からフレーム名を取得"""
@@ -112,7 +153,13 @@ class DbcLoader:
 
         try:
             decoded = msg.decode(frame.data, decode_choices=False)
-        except Exception:
+        except Exception as ex:
+            # 多重化フレームで該当 mux 値のシグナルが復号できない場合や、
+            # データ長不足等で起きうる。INFO レベルで一度だけ記録する想定で DEBUG。
+            _log.debug(
+                "decode_frame: id=0x%X (%s) のデコード失敗: %s",
+                frame.arbitration_id, msg.name, ex,
+            )
             return []
 
         result = []
@@ -124,6 +171,13 @@ class DbcLoader:
                     raw = int((phys_val - signal.offset) / signal.scale)
                 else:
                     raw = int(phys_val)
+                # Value Table (VAL_) があれば raw 値からラベルを引く
+                choice_text: Optional[str] = None
+                choices = getattr(signal, "choices", None)
+                if choices:
+                    label = choices.get(raw)
+                    if label is not None:
+                        choice_text = str(label)
                 result.append(SignalValue(
                     signal_name=signal.name,
                     raw_value=raw,
@@ -131,7 +185,38 @@ class DbcLoader:
                     unit=signal.unit or "",
                     timestamp=frame.timestamp,
                     frame_id=frame.arbitration_id,
+                    choice_text=choice_text,
                 ))
+        return result
+
+    def get_signal_value_labels(
+        self, arbitration_id: int, signal_name: str, use_physical: bool = True,
+    ) -> Optional[Dict[float, str]]:
+        """Value Table (choices) を Y 軸ラベル用に返す。
+
+        Returns:
+            {表示Y値: ラベル文字列} の辞書。Value Table 未定義の場合は None。
+            use_physical=True の場合、Y 値は physical (raw*scale+offset)。
+        """
+        try:
+            msg = self._db.get_message_by_frame_id(arbitration_id)
+        except KeyError:
+            return None
+        sig = next((s for s in msg.signals if s.name == signal_name), None)
+        if sig is None:
+            return None
+        choices = getattr(sig, "choices", None)
+        if not choices:
+            return None
+        scale = getattr(sig, "scale", 1) or 1
+        offset = getattr(sig, "offset", 0) or 0
+        result: Dict[float, str] = {}
+        for raw_val, label in choices.items():
+            if use_physical:
+                y_val = float(raw_val) * scale + offset
+            else:
+                y_val = float(raw_val)
+            result[y_val] = str(label)
         return result
 
     def get_signal_info(self, arbitration_id: int) -> List[dict]:

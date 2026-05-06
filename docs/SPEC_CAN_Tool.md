@@ -585,6 +585,32 @@ def receive_loop(bus: can.Bus, frame_queue: Queue):
 - python-can の Vector インターフェースが利用可能であること
 - Vector Hardware Config で該当チャンネルがアプリケーションに割り当てられていること
 
+#### 6.5.4 実装構成
+
+- **`realtime/can_receiver.py`**: `CanReceiver` クラスが python-can `Bus` を専用ワーカースレッドで監視し、受信メッセージを `CanFrame` に変換して `queue.Queue (maxsize=50000)` に投入する。GUI スレッドは `drain(max_items)` でバッチ取得（200ms ごとにポーリング）。
+- **接続設定 (`ReceiverConfig`)**: interface (`vector` / `virtual`), channel, app_name, fd, bitrate, data_bitrate, log_path（任意の ASC ライブログ出力先）。
+- **VirtualBus 対応**: ハードウェア未接続でも開発・テストを進められるよう、interface=`virtual` を選択肢に含める（python-can の VirtualBus を使用）。
+- **チャンネル自動検出**: `list_vector_channels()` が XL Driver の `canlib.get_channel_configs()` から利用可能チャンネルを列挙する。XL Driver 未導入時は空リストを返し、ダイアログは手動入力にフォールバック。
+- **ASC ライブログ (RT-5)**: `asc_writer.format_frame_as_asc()` がリアルタイム受信の単一フレームを Vector ASC のサブセット行（パーサがラウンドトリップ可能な必須フィールドのみ）に整形する。Length / BitCount / bit_timing 等の情報フィールドは省略。
+- **キュー満杯時の挙動**: `queue.Full` 例外で受信フレームをドロップし `dropped_count` をインクリメントする（GUI 遅延時のメモリ枯渇を防ぐ保護機構）。
+- **接続 UI**: `gui/connection_dialog.py::ConnectionDialog` が AlertDialog でインターフェース・チャンネル・ボーレート・FD 有効化・ASC ログ保存先を入力させる。`ReceiverConfig` 確定後に main_window が `CanReceiver` を起動し、`page.run_task` で 200ms ごとに `drain()` → `TracePanel.add_frames()` を呼ぶ。
+- **リアルタイムグラフ表示 (RT-7)**: `GraphPanel.add_frames(frames)` で受信バッチを既存の時系列バッファ（`_frames_by_id`）と `_time_range` に追記し、`refresh_live()` で再描画する。matplotlib SVG プレビュー生成はコスト高のため、main_window のポーリングループで **1Hz** にスロットルする (200ms 間隔の受信処理に対し 5 回に 1 回の再描画)。
+- **リアルタイム受信フィルタ (RT-4)**: `TracePanel.add_frames` がバッチ追記時に既存の検索/チャンネル/方向/Type フィルタを適用するため、ライブ受信中もフィルタ条件を変更すれば次のフィルタ更新で全フレームに再適用される。
+
+### 6.7 品質機能 (Phase 4)
+
+- **カーソル同期 (双方向)**:
+  - **トレース → グラフ**: トレース行クリック → `MainWindow._on_frame_selected` → `GraphPanel.set_cursor_time()` でグラフに赤縦線を描画する (matplotlib SVG + Plotly figure 双方)。
+  - **グラフ → トレース (アプリ内 SVG)**: matplotlib プレビューを `ft.GestureDetector` で包み `on_tap_down.local_x` を取得。`subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.10)` で axes 位置を全レンダ固定にし、`local_x / display_width` を axes 内比率に正規化して X 軸データ範囲に逆変換 → `TracePanel.jump_to_time()` で二分探索ジャンプ。`page.on_resized` で表示幅を追跡する。
+  - **グラフ → トレース (ブラウザ Plotly)**: `utils/click_server.py::ChartClickServer` が stdlib `http.server` ベースの軽量サーバを 127.0.0.1:OS割当ポート で起動 (lazy)。`build_plotly_html()` が Plotly figure に `plotly_click` リスナ JS を `post_script` 経由で埋め込み、クリック時刻を `POST /click` で送信。Flet 側は 200ms ごとに `drain_clicks()` でキューを取り出し、アプリ内クリックと同じ `_on_graph_time_clicked()` でトレースジャンプに転送。ファイアウォール影響を避けるため localhost のみ listen。サーバ起動失敗時は従来通り `tempfile + file://` フォールバック。
+- **Value Table デコード (DBC-7)**: `DbcLoader.decode_frame` が `cantools` の `signal.choices` を参照して raw 値からラベルを引き、`SignalValue.choice_text` に格納する。トレース詳細の Physical 列は `数値 (ラベル)` 形式で表示。
+- **統計 CSV エクスポート (STA-6)**: `gui/statistics_panel.py::write_statistics_csv()` が ID/Name/Channel/Count/Avg/Min/Max/Std/First/Last の 10 列で CSV 出力。「CSV エクスポート」ボタンから main_window 経由で保存ダイアログ。
+- **キーボードショートカット**: `MainWindow._on_keyboard_event` がグローバルキーイベントを処理。
+  - `Ctrl+O` ASC 開く / `Ctrl+D` DB 開く / `Ctrl+E` エクスポート / `Ctrl+Shift+E` DB 抽出
+  - `Ctrl+S` 設定保存 / `Ctrl+L` 設定読込 / `Ctrl+K` 接続 / `Ctrl+Shift+K` 停止
+  - `Ctrl+1/2/3` タブ切替 (トレース/グラフ/統計) / `F5` 統計更新 (統計タブ表示中のみ)
+- **集約ロガー / エラーハンドリング**: `utils/logger.py` が `%APPDATA%/can_analyzer/app.log` (Windows) / `~/.can_analyzer/app.log` (その他) に DEBUG 以上を、stderr に INFO 以上を出力する。`MainWindow._show_error(message, exc=None)` がユーザ通知 + スタックトレース記録を統一処理し、ログパス案内も snackbar に追記する。ツールバーの 🐛 アイコンから既定アプリでログファイルを開ける。受信ループ・DBC デコード・GUI 例外は適切に `logger.exception()` でスタックトレース付き記録される。
+
 ### 6.6 パフォーマンス目標
 
 | 項目 | 目標値 |
@@ -638,12 +664,12 @@ Vector VN1610 によるリアルタイム受信機能。
 
 ### Phase 4: 品質向上・追加機能
 
-- [ ] 単体テスト整備
-- [ ] カーソル同期（グラフ ↔ トレース）
-- [ ] Value Table デコード
-- [ ] 統計 CSV エクスポート
-- [ ] キーボードショートカット
-- [ ] エラーハンドリング改善
+- [x] 単体テスト整備（pytest 25 ケース: パーサ・ライタ・受信・DBC・統計・ロガー）
+- [x] カーソル同期（トレース → グラフ。逆方向は静的 SVG 制約により未対応）
+- [x] Value Table デコード
+- [x] 統計 CSV エクスポート
+- [x] キーボードショートカット
+- [x] エラーハンドリング改善（集約ロガー + `_show_error` ヘルパ）
 
 ---
 

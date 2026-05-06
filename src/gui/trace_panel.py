@@ -309,6 +309,70 @@ class TracePanel(ft.Column):
         """現在のフィルタで表示中のフレーム ID セットを返す"""
         return set(f.arbitration_id for f in self._filtered_frames)
 
+    def add_frames(self, frames: List[CanFrame]) -> None:
+        """リアルタイム受信用: バッチで受信フレームを追記する
+
+        - フィルタ条件にマッチしたものだけ _filtered_frames に追加
+        - チャンネル選択肢に新規チャンネルが含まれていれば追加
+        - 末尾ページを表示中なら再描画して新規行を反映、それ以外はカウント更新のみ
+        """
+        if not frames:
+            return
+
+        self._all_frames.extend(frames)
+
+        # 新規チャンネル検出
+        existing_ch = {opt for opt in self._channel_selector._options if opt != "All"}
+        new_channels = sorted({str(f.channel) for f in frames} - existing_ch)
+        if new_channels:
+            options = ["All"] + sorted(
+                existing_ch | set(new_channels), key=lambda s: int(s)
+            )
+            self._channel_selector.set_options(options, value=self._channel_selector.value)
+
+        # 既存フィルタで合致するものだけ filtered に追加
+        added_to_filtered = 0
+        for f in frames:
+            if self._frame_matches_filter(f):
+                self._filtered_frames.append(f)
+                added_to_filtered += 1
+
+        if added_to_filtered == 0:
+            return
+
+        total = len(self._filtered_frames)
+        total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+        is_at_last_page = self._page_index >= total_pages - 1
+
+        if is_at_last_page:
+            self._render_current_page()
+        else:
+            # 末尾以外を見ているときはカウントだけ更新（ユーザのスクロール位置を維持）
+            start = self._page_index * PAGE_SIZE
+            end = min(start + PAGE_SIZE, total)
+            self._count_text.value = (
+                f"{start+1:,}-{end:,} / {total:,} frames  (p.{self._page_index+1}/{total_pages})"
+            )
+
+    def _frame_matches_filter(self, f: CanFrame) -> bool:
+        """1 フレームが現在のフィルタ条件に合致するか判定"""
+        search = self._search_field.value.strip().upper() if self._search_field.value else ""
+        ch_val = self._channel_selector.value
+        dir_val = self._dir_selector.value
+        type_val = self._type_selector.value
+        if ch_val != "All" and f.channel != int(ch_val):
+            return False
+        if dir_val != "All" and f.dir_str != dir_val:
+            return False
+        if type_val != "All" and f.type_str != type_val:
+            return False
+        if search:
+            id_hex = f.id_hex.upper()
+            name = (f.frame_name or "").upper()
+            if search not in id_hex and search not in name:
+                return False
+        return True
+
     # ---------- Filtering / paging ----------
 
     def _apply_filter(self) -> None:
@@ -458,7 +522,7 @@ class TracePanel(ft.Column):
             controls=[
                 _text_cell("Signal", 220),
                 _text_cell("Raw", 90),
-                _text_cell("Physical", 120),
+                _text_cell("Physical", 220),
                 _text_cell("Unit", 80),
             ],
             spacing=0,
@@ -476,12 +540,17 @@ class TracePanel(ft.Column):
         )
 
         for sv in signals:
+            # Value Table がある場合は Physical 列に "数値 (ラベル)" 形式で表示
+            if sv.choice_text:
+                phys_text = f"{sv.physical_value:.6g} ({sv.choice_text})"
+            else:
+                phys_text = f"{sv.physical_value:.6g}"
             controls.append(
                 ft.Row(
                     controls=[
                         _text_cell(sv.signal_name, 220, mono=True),
                         _text_cell(str(sv.raw_value), 90, mono=True),
-                        _text_cell(f"{sv.physical_value:.6g}", 120, mono=True),
+                        _text_cell(phys_text, 220, mono=True),
                         _text_cell(sv.unit, 80),
                     ],
                     spacing=0,
@@ -547,6 +616,17 @@ class TracePanel(ft.Column):
             target = float(text)
         except ValueError:
             return
+        self.jump_to_time(target)
+
+    def jump_to_time(self, target: float) -> None:
+        """指定時刻 (秒) に最も近い行へジャンプする。
+
+        グラフクリック → トレースジャンプの統合用 API。
+        フィルタ済み行リストに対する二分探索でページを切替え、
+        ページ内オフセットへスクロールする。
+        """
+        if not self._filtered_frames:
+            return
         times = [f.timestamp for f in self._filtered_frames]
         idx = bisect.bisect_left(times, target)
         if idx >= len(times):
@@ -556,7 +636,10 @@ class TracePanel(ft.Column):
         if new_page != self._page_index:
             self._page_index = new_page
             self._render_current_page()
-            self.update()
+            try:
+                self.update()
+            except (AssertionError, RuntimeError):
+                pass
 
         offset_in_page = idx - self._page_index * PAGE_SIZE
         self._schedule_scroll(offset_in_page * _ROW_HEIGHT)
